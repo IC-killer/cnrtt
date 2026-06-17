@@ -30,7 +30,7 @@ ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*m')
 class RTTViewerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("第三方 RTT Viewer (支持中文及色彩)")
+        self.root.title("CN RTT Viewer (支持中文及色彩)")
         self.root.geometry("700x500")
 
         self.jlink = None
