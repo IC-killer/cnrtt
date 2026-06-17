@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cnrtt"
+version = "0.1.0"
+description = "一个支持中文及色彩的第三方 RTT (Real-Time Transfer) 客户端，基于 SEGGER J-Link，使用 UTF-8 编码"
+readme = "README.md"
+requires-python = ">=3.7"
+license = { text = "MIT" }
+authors = [
+    { name = "cnrtt contributors" }
+]
+keywords = ["rtt", "jlink", "segger", "embedded", "debug", "tkinter", "utf-8", "chinese"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: X11 Applications",
+    "Environment :: Win32 (MS Windows)",
+    "Environment :: MacOS X",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.7",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Embedded Systems",
+    "Topic :: Terminals",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "pylink-square>=0.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "build>=1.0",
+    "twine>=4.0",
+]
+
+[project.scripts]
+cnrtt = "cnrtt.app:main"
+
+[project.gui-scripts]
+cnrtt-gui = "cnrtt.app:main"
+
+[project.urls]
+Homepage = "https://example.com/cnrtt"
+Issues = "https://example.com/cnrtt/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+cnrtt = ["*.txt", "*.json"]

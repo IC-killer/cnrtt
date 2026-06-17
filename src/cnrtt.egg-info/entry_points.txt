@@ -1,0 +1,5 @@
+[console_scripts]
+cnrtt = cnrtt.app:main
+
+[gui_scripts]
+cnrtt-gui = cnrtt.app:main
