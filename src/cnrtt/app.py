@@ -56,8 +56,13 @@ class RTTViewerApp:
         self.iface_combo = ttk.Combobox(top_frame, textvariable=self.iface_var, values=["SWD", "JTAG"], width=5, state="readonly")
         self.iface_combo.grid(row=0, column=3, padx=5)
 
+        tk.Label(top_frame, text="字符集:").grid(row=0, column=4, padx=5)
+        self.charset_var = tk.StringVar(value=self.history.get("last_charset", "UTF-8"))
+        self.charset_combo = ttk.Combobox(top_frame, textvariable=self.charset_var, values=["UTF-8", "GB2312"], width=8, state="readonly")
+        self.charset_combo.grid(row=0, column=5, padx=5)
+
         self.connect_btn = tk.Button(top_frame, text="连接", command=self.toggle_connection)
-        self.connect_btn.grid(row=0, column=4, padx=10)
+        self.connect_btn.grid(row=0, column=6, padx=10)
 
         # 中部日志输出区
         mid_frame = tk.Frame(root, padx=10)
@@ -147,6 +152,7 @@ class RTTViewerApp:
 
         self.history["devices"] = devices
         self.history["last_device"] = current_device
+        self.history["last_charset"] = self.charset_var.get()
 
         self.device_combo['values'] = devices
 
@@ -183,6 +189,7 @@ class RTTViewerApp:
             self.connect_btn.config(text="断开")
             self.device_combo.config(state=tk.DISABLED)
             self.iface_combo.config(state=tk.DISABLED)
+            self.charset_combo.config(state=tk.DISABLED)
             self.save_history()
 
             self.rtt_thread = threading.Thread(target=self.read_rtt_loop, daemon=True)
@@ -215,15 +222,17 @@ class RTTViewerApp:
         self.connect_btn.config(text="连接")
         self.device_combo.config(state="normal")
         self.iface_combo.config(state="readonly")
+        self.charset_combo.config(state="readonly")
         self.append_output("[系统] 已断开连接。\n")
 
     def read_rtt_loop(self):
+        charset = self.charset_var.get()
         while self.is_connected and self.jlink:
             try:
                 data = self.jlink.rtt_read(0, 1024)
                 if data:
                     byte_data = bytes(data)
-                    text = byte_data.decode('utf-8', errors='replace')
+                    text = byte_data.decode(charset, errors='replace')
                     self.msg_queue.put(text)
             except Exception as e:
                 self.msg_queue.put(f"[读取错误] {str(e)}\n")
@@ -239,7 +248,8 @@ class RTTViewerApp:
         if not text:
             return
 
-        send_data = (text + '\n').encode('utf-8')
+        charset = self.charset_var.get()
+        send_data = (text + '\n').encode(charset, errors='replace')
 
         try:
             self.jlink.rtt_write(0, list(send_data))
