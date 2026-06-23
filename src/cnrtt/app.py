@@ -89,14 +89,36 @@ class RTTViewerApp:
         self.input_entry = tk.Entry(bottom_frame, font=("Consolas", 10))
         self.input_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.input_entry.bind("<Return>", self.send_input)
+        self.input_entry.bind("<Up>", self.input_history_up)
+        self.input_entry.bind("<Down>", self.input_history_down)
 
         self.send_btn = tk.Button(bottom_frame, text="发送", command=self.send_input)
         self.send_btn.pack(side=tk.LEFT, padx=10)
+
+        # 显示发送选项
+        self.echo_send_var = tk.BooleanVar(value=self.history.get("echo_send", False))
+        self.echo_send_cb = tk.Checkbutton(bottom_frame, text="显示发送", variable=self.echo_send_var, command=self.save_history)
+        self.echo_send_cb.pack(side=tk.LEFT, padx=5)
+
+        # 显示原始数据（Hex Dump）选项
+        self.hex_dump_var = tk.BooleanVar(value=self.history.get("hex_dump", False))
+        self.hex_dump_cb = tk.Checkbutton(bottom_frame, text="Hex", variable=self.hex_dump_var, command=self.save_history)
+        self.hex_dump_cb.pack(side=tk.LEFT, padx=5)
+
+        # 输入历史记录
+        self.input_history = self.history.get("input_history", [])
+        self.input_history_idx = -1  # -1 表示不在历史浏览中
 
         # 用于保存不完整的 ANSI 序列
         self.ansi_buffer = ""
         # 当前激活的颜色样式
         self.current_style = None
+
+        # 全局快捷键
+        root.bind("<F2>", lambda e: self.connect() if not self.is_connected else None)
+        root.bind("<F3>", lambda e: self.disconnect() if self.is_connected else None)
+        root.bind("<Alt-r>", lambda e: self.clear_output())
+        root.bind("<Alt-R>", lambda e: self.clear_output())
 
         # 启动UI更新轮询
         self.process_queue()
@@ -153,6 +175,9 @@ class RTTViewerApp:
         self.history["devices"] = devices
         self.history["last_device"] = current_device
         self.history["last_charset"] = self.charset_var.get()
+        self.history["echo_send"] = self.echo_send_var.get()
+        self.history["hex_dump"] = self.hex_dump_var.get()
+        self.history["input_history"] = self.input_history
 
         self.device_combo['values'] = devices
 
@@ -232,6 +257,9 @@ class RTTViewerApp:
                 data = self.jlink.rtt_read(0, 1024)
                 if data:
                     byte_data = bytes(data)
+                    if self.hex_dump_var.get():
+                        hex_str = ' '.join(f'{b:02X}' for b in byte_data)
+                        self.msg_queue.put(f"[HEX {len(byte_data)}B] {hex_str}\n")
                     text = byte_data.decode(charset, errors='replace')
                     self.msg_queue.put(text)
             except Exception as e:
@@ -250,12 +278,72 @@ class RTTViewerApp:
 
         charset = self.charset_var.get()
         send_data = (text + '\n').encode(charset, errors='replace')
+        total = len(send_data)
 
         try:
-            self.jlink.rtt_write(0, list(send_data))
+            # 循环写入直到全部发送完毕（处理下行缓冲区满的情况）
+            offset = 0
+            retries = 0
+            data = list(send_data)
+            while offset < total:
+                written = self.jlink.rtt_write(0, data[offset:])
+                offset += written
+                if written == 0:
+                    if retries < 20:
+                        retries += 1
+                        time.sleep(0.01)
+                    else:
+                        break
+                else:
+                    retries = 0
+
+            # 回显发送内容到输出框
+            if self.echo_send_var.get():
+                if offset < total:
+                    self.append_output(f"[发送 {offset}/{total}B 截断] {text}\n")
+                else:
+                    self.append_output(f"[发送 {total}B] {text}\n")
+            # 添加到输入历史（去重、限长）
+            if not self.input_history or self.input_history[-1] != text:
+                self.input_history.append(text)
+                if len(self.input_history) > 100:
+                    self.input_history.pop(0)
+            self.input_history_idx = -1
             self.input_entry.delete(0, tk.END)
         except Exception as e:
             self.append_output(f"[发送错误] {str(e)}\n")
+
+    def input_history_up(self, event):
+        """上箭头：浏览更早的历史记录"""
+        if not self.input_history:
+            return "break"
+
+        if self.input_history_idx == -1:
+            # 首次进入历史模式，保存当前输入框内容以便恢复
+            self._temp_input = self.input_entry.get()
+            self.input_history_idx = len(self.input_history) - 1
+        elif self.input_history_idx > 0:
+            self.input_history_idx -= 1
+
+        self.input_entry.delete(0, tk.END)
+        self.input_entry.insert(0, self.input_history[self.input_history_idx])
+        return "break"
+
+    def input_history_down(self, event):
+        """下箭头：浏览更新的历史记录"""
+        if self.input_history_idx == -1:
+            return "break"
+
+        if self.input_history_idx < len(self.input_history) - 1:
+            self.input_history_idx += 1
+            self.input_entry.delete(0, tk.END)
+            self.input_entry.insert(0, self.input_history[self.input_history_idx])
+        else:
+            # 超出最新记录，恢复原始输入内容
+            self.input_history_idx = -1
+            self.input_entry.delete(0, tk.END)
+            self.input_entry.insert(0, getattr(self, '_temp_input', ''))
+        return "break"
 
     def process_queue(self):
         try:
@@ -327,6 +415,10 @@ class RTTViewerApp:
     def on_closing(self):
         self.disconnect()
         self.root.destroy()
+
+    def clear_output(self):
+        """清空输出框"""
+        self.output_text.delete("1.0", tk.END)
 
 
 def main():
