@@ -11,4 +11,5 @@ src/cnrtt.egg-info/dependency_links.txt
 src/cnrtt.egg-info/entry_points.txt
 src/cnrtt.egg-info/requires.txt
 src/cnrtt.egg-info/top_level.txt
+src/cnrtt/assets/cnrtt.ico
 tests/test_smoke.py

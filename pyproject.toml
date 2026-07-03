@@ -57,4 +57,4 @@ Issues = "https://example.com/cnrtt/issues"
 where = ["src"]
 
 [tool.setuptools.package-data]
-cnrtt = ["*.txt", "*.json"]
+cnrtt = ["*.txt", "*.json", "assets/*.ico"]
