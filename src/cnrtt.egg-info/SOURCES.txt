@@ -4,7 +4,11 @@ pyproject.toml
 setup.cfg
 src/cnrtt/__init__.py
 src/cnrtt/__main__.py
+src/cnrtt/agent_client.py
+src/cnrtt/agent_server.py
 src/cnrtt/app.py
+src/cnrtt/cli.py
+src/cnrtt/core.py
 src/cnrtt.egg-info/PKG-INFO
 src/cnrtt.egg-info/SOURCES.txt
 src/cnrtt.egg-info/dependency_links.txt
@@ -12,4 +16,6 @@ src/cnrtt.egg-info/entry_points.txt
 src/cnrtt.egg-info/requires.txt
 src/cnrtt.egg-info/top_level.txt
 src/cnrtt/assets/cnrtt.ico
+tests/test_agent_server.py
+tests/test_core.py
 tests/test_smoke.py

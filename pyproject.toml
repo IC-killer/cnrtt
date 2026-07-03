@@ -44,7 +44,8 @@ dev = [
 ]
 
 [project.scripts]
-cnrtt = "cnrtt.app:main"
+cnrtt = "cnrtt.cli:main"
+cnrtt-agent-client = "cnrtt.agent_client:cli_main"
 
 [project.gui-scripts]
 cnrtt-gui = "cnrtt.app:main"

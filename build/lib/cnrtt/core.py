@@ -1,0 +1,486 @@
+"""RTTCore —— cnrtt 的纯逻辑核心层。
+
+本模块不依赖 tkinter / GUI，提供连接管理、收发、配置与事件总线，
+供 GUI（RTTViewerApp）和 AI agent 服务端（AgentServer）共享。
+
+设计要点：
+- 单一真实源：所有 RTT 状态只存在于 RTTCore 实例中。
+- 事件总线：GUI / Agent 通过 subscribe 订阅 output / status / error / config 事件，
+  回调统一在 core 的回调线程中调用；GUI 侧需自行 marshal 回主线程。
+- 环形缓冲：守护线程把读取到的文本写入 deque，供 get_output 增量拉取。
+- 配置分离：人工 GUI 配置存 ~/.cnrtt/rtt_history.json；
+  agent 配置存 ~/.cnrtt/agent_config.json；agent 命令历史存 ~/.cnrtt/agent_history.json。
+- 线程安全：connect/disconnect/send/config 操作均通过 self._lock 串行化。
+"""
+
+from __future__ import annotations
+
+import collections
+import json
+import os
+import threading
+import time
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
+
+import pylink
+
+# ── 配置文件路径 ──────────────────────────────────────────────
+CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".cnrtt")
+GUI_CONFIG_FILE = os.path.join(CONFIG_DIR, "rtt_history.json")
+AGENT_CONFIG_FILE = os.path.join(CONFIG_DIR, "agent_config.json")
+AGENT_HISTORY_FILE = os.path.join(CONFIG_DIR, "agent_history.json")
+
+# 默认配置
+DEFAULT_DEVICE = "STM32F407VE"
+DEFAULT_IFACE = "SWD"
+DEFAULT_CHARSET = "UTF-8"
+
+# 环形缓冲容量（字符数）
+OUTPUT_BUFFER_SIZE = 64 * 1024
+# agent 命令历史上限
+AGENT_HISTORY_LIMIT = 1000
+
+
+class RTTError(Exception):
+    """RTT 业务错误，携带可读消息；agent_server 会映射为 JSON-RPC 错误码。"""
+
+
+# ── 事件类型 ──────────────────────────────────────────────────
+EVENT_OUTPUT = "output"      # text: str
+EVENT_STATUS = "status"      # connected: bool
+EVENT_CONFIG = "config"      # config: dict
+EVENT_ERROR = "error"        # message: str
+
+
+class RTTCore:
+    """RTT 工具核心，零 GUI 依赖。
+
+    线程模型：
+    - 主线程：调用 connect/disconnect/send/set_config 等。
+    - 守护线程 _read_loop：持续 rtt_read，把文本投递给事件总线 + 环形缓冲。
+    - 事件回调：在调用 subscribe 的线程之外触发，订阅者需自行线程安全。
+    """
+
+    def __init__(
+        self,
+        output_buffer_size: int = OUTPUT_BUFFER_SIZE,
+        read_interval: float = 0.01,
+        send_retries: int = 20,
+    ) -> None:
+        self._lock = threading.RLock()
+        self._sub_lock = threading.Lock()
+        self._subs: Dict[int, Callable[[str, Dict[str, Any]], None]] = {}
+        self._next_sub_id = 1
+
+        # RTT 连接状态
+        self._jlink: Optional[Any] = None
+        self._connected = False
+        self._read_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+
+        # 配置（运行期可变）
+        self._device = DEFAULT_DEVICE
+        self._iface = DEFAULT_IFACE
+        self._charset = DEFAULT_CHARSET
+        self._echo_send = False
+        self._hex_dump = False
+
+        # GUI 配置（设备历史等）
+        self._gui_history: Dict[str, Any] = {
+            "last_device": DEFAULT_DEVICE,
+            "devices": [DEFAULT_DEVICE],
+        }
+
+        # 输出环形缓冲：存 (seq, text)，seq 单调递增
+        self._output_buf: Deque[Tuple[int, str]] = collections.deque(
+            maxlen=output_buffer_size
+        )
+        self._output_seq = 0
+        self._output_lock = threading.Lock()
+
+        # 读取/发送参数
+        self._read_interval = read_interval
+        self._send_retries = send_retries
+
+        # agent 命令历史（由 agent_server 维护，core 提供存取）
+        self._agent_history: List[str] = []
+
+    # ── 事件总线 ──────────────────────────────────────────────
+    def subscribe(self, callback: Callable[[str, Dict[str, Any]], None]) -> int:
+        """订阅事件。callback(event_type, payload)。返回 sub_id 用于取消。"""
+        with self._sub_lock:
+            sid = self._next_sub_id
+            self._next_sub_id += 1
+            self._subs[sid] = callback
+            return sid
+
+    def unsubscribe(self, sub_id: int) -> None:
+        with self._sub_lock:
+            self._subs.pop(sub_id, None)
+
+    def _emit(self, event_type: str, payload: Dict[str, Any]) -> None:
+        """向所有订阅者广播事件。回调异常被吞掉，避免影响其他订阅者。"""
+        with self._sub_lock:
+            subs = list(self._subs.values())
+        for cb in subs:
+            try:
+                cb(event_type, payload)
+            except Exception:
+                # 订阅者出错不应阻断 core；GUI 侧的 marshal 错误也忽略
+                pass
+
+    # ── 连接 ──────────────────────────────────────────────────
+    @property
+    def is_connected(self) -> bool:
+        with self._lock:
+            return self._connected
+
+    def connect(
+        self,
+        device: Optional[str] = None,
+        iface: Optional[str] = None,
+        charset: Optional[str] = None,
+    ) -> bool:
+        """连接 J-Link 并启动 RTT。失败抛 RTTError。成功返回 True。"""
+        with self._lock:
+            if self._connected:
+                # 已连接则先断开，确保状态干净
+                try:
+                    self._disconnect_locked()
+                except Exception:
+                    pass
+
+            if device:
+                self._device = device
+            if iface:
+                self._iface = iface
+            if charset:
+                self._charset = charset
+
+            try:
+                self._jlink = pylink.JLink()
+                self._jlink.open()
+
+                iface_enum = (
+                    pylink.enums.JLinkInterfaces.SWD
+                    if self._iface == "SWD"
+                    else pylink.enums.JLinkInterfaces.JTAG
+                )
+                try:
+                    self._jlink.set_tif(iface_enum)
+                except AttributeError:
+                    pass
+
+                self._jlink.connect(self._device)
+                self._jlink.rtt_start()
+                time.sleep(0.2)
+
+                self._connected = True
+                self._stop_event.clear()
+                self._read_thread = threading.Thread(
+                    target=self._read_loop, daemon=True
+                )
+                self._read_thread.start()
+
+                self._emit_output("[系统] 连接成功，RTT 已启动。\n")
+                self._emit(EVENT_STATUS, {"connected": True})
+                self._emit(
+                    EVENT_CONFIG,
+                    {
+                        "device": self._device,
+                        "iface": self._iface,
+                        "charset": self._charset,
+                        "echo_send": self._echo_send,
+                        "hex_dump": self._hex_dump,
+                    },
+                )
+                return True
+            except Exception as e:
+                # 清理半开连接
+                if self._jlink:
+                    try:
+                        self._jlink.close()
+                    except Exception:
+                        pass
+                    self._jlink = None
+                self._connected = False
+                msg = f"[系统错误] {e}\n"
+                self._emit_output(msg)
+                self._emit(EVENT_ERROR, {"message": str(e)})
+                raise RTTError(str(e)) from e
+
+    def disconnect(self) -> None:
+        with self._lock:
+            self._disconnect_locked()
+        self._emit_output("[系统] 已断开连接。\n")
+        self._emit(EVENT_STATUS, {"connected": False})
+
+    def _disconnect_locked(self) -> None:
+        """断开（调用方已持锁）。"""
+        self._connected = False
+        self._stop_event.set()
+        if self._read_thread and self._read_thread.is_alive():
+            self._read_thread.join(timeout=1.0)
+        self._read_thread = None
+
+        if self._jlink:
+            try:
+                if self._jlink.connected():
+                    self._jlink.rtt_stop()
+                self._jlink.close()
+            except Exception:
+                pass
+            self._jlink = None
+
+    # ── 读取循环 ──────────────────────────────────────────────
+    def _read_loop(self) -> None:
+        """守护线程：持续读取 RTT 通道 0，写入缓冲并广播事件。"""
+        charset = self._charset
+        while not self._stop_event.is_set() and self._connected and self._jlink:
+            try:
+                data = self._jlink.rtt_read(0, 1024)
+                if data:
+                    byte_data = bytes(data)
+                    if self._hex_dump:
+                        hex_str = " ".join(f"{b:02X}" for b in byte_data)
+                        self._emit_output(f"[HEX {len(byte_data)}B] {hex_str}\n")
+                    text = byte_data.decode(charset, errors="replace")
+                    self._emit_output(text)
+            except Exception as e:
+                self._emit_output(f"[读取错误] {e}\n")
+                self._emit(EVENT_ERROR, {"message": f"read error: {e}"})
+                # 读取异常视为连接断开
+                self._connected = False
+                self._emit(EVENT_STATUS, {"connected": False})
+                break
+            self._stop_event.wait(self._read_interval)
+
+    def _emit_output(self, text: str) -> None:
+        """写入输出缓冲并广播 output 事件。"""
+        with self._output_lock:
+            self._output_seq += 1
+            seq = self._output_seq
+            self._output_buf.append((seq, text))
+        self._emit(EVENT_OUTPUT, {"text": text, "seq": seq})
+
+    # ── 发送 ──────────────────────────────────────────────────
+    def send(self, text: str, append_newline: bool = True) -> int:
+        """发送文本到 RTT 通道 0。返回写入字节数。未连接抛 RTTError。"""
+        if not text:
+            return 0
+        with self._lock:
+            if not self._connected or not self._jlink:
+                raise RTTError("not connected")
+            payload = text + ("\n" if append_newline else "")
+            send_data = payload.encode(self._charset, errors="replace")
+            total = len(send_data)
+            data = list(send_data)
+            offset = 0
+            retries = 0
+            try:
+                while offset < total:
+                    written = self._jlink.rtt_write(0, data[offset:])
+                    offset += written
+                    if written == 0:
+                        if retries < self._send_retries:
+                            retries += 1
+                            time.sleep(0.01)
+                        else:
+                            break
+                    else:
+                        retries = 0
+
+                # 回显
+                if self._echo_send:
+                    if offset < total:
+                        self._emit_output(
+                            f"[发送 {offset}/{total}B 截断] {text}\n"
+                        )
+                    else:
+                        self._emit_output(f"[发送 {total}B] {text}\n")
+                return offset
+            except Exception as e:
+                msg = f"[发送错误] {e}\n"
+                self._emit_output(msg)
+                self._emit(EVENT_ERROR, {"message": f"send error: {e}"})
+                raise RTTError(f"send error: {e}") from e
+
+    # ── 输出拉取 ──────────────────────────────────────────────
+    def get_output(
+        self, since: int = 0, limit: int = 10000, clear: bool = False
+    ) -> Tuple[List[str], int]:
+        """增量拉取输出。返回 (lines, next_cursor)。
+
+        - since: 上次返回的 next_cursor，0 表示从头取当前缓冲。
+        - limit: 最多返回多少条（每条对应一次 _emit_output 调用）。
+        - clear: 取走后是否从缓冲移除（影响后续 since 行为）。
+        """
+        with self._output_lock:
+            items = [it for it in self._output_buf if it[0] > since]
+            if len(items) > limit:
+                items = items[-limit:]
+            lines = [it[1] for it in items]
+            next_cursor = items[-1][0] if items else since
+            if clear and items:
+                # 仅清除已取走的部分
+                last_taken = items[-1][0]
+                while self._output_buf and self._output_buf[0][0] <= last_taken:
+                    self._output_buf.popleft()
+            return lines, next_cursor
+
+    def clear_output(self) -> None:
+        with self._output_lock:
+            self._output_buf.clear()
+            # seq 继续递增，避免 since=0 的旧客户端重复取到旧数据语义混乱
+        self._emit_output("[系统] 输出已清空。\n")
+
+    # ── 配置 ──────────────────────────────────────────────────
+    def get_config(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "device": self._device,
+                "iface": self._iface,
+                "charset": self._charset,
+                "echo_send": self._echo_send,
+                "hex_dump": self._hex_dump,
+                "connected": self._connected,
+            }
+
+    def set_config(self, **kwargs: Any) -> Dict[str, Any]:
+        """更新运行期配置。支持 device/iface/charset/echo_send/hex_dump。
+        已连接时更改 device/iface/charset 不会重连，需显式 disconnect+connect。
+        """
+        with self._lock:
+            for k in ("device", "iface", "charset"):
+                if k in kwargs and kwargs[k] is not None:
+                    setattr(self, f"_{k}", str(kwargs[k]))
+            if "echo_send" in kwargs and kwargs["echo_send"] is not None:
+                self._echo_send = bool(kwargs["echo_send"])
+            if "hex_dump" in kwargs and kwargs["hex_dump"] is not None:
+                self._hex_dump = bool(kwargs["hex_dump"])
+        cfg = self.get_config()
+        self._emit(EVENT_CONFIG, cfg)
+        return cfg
+
+    # ── GUI 配置（设备历史等）持久化 ──────────────────────────
+    def load_gui_config(self) -> Dict[str, Any]:
+        if os.path.exists(GUI_CONFIG_FILE):
+            try:
+                with open(GUI_CONFIG_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    self._gui_history = data
+                    # 同步到运行期配置
+                    if data.get("last_device"):
+                        self._device = data["last_device"]
+                    if data.get("last_charset"):
+                        self._charset = data["last_charset"]
+                    if data.get("echo_send") is not None:
+                        self._echo_send = data["echo_send"]
+                    if data.get("hex_dump") is not None:
+                        self._hex_dump = data["hex_dump"]
+                    return data
+            except Exception:
+                pass
+        return dict(self._gui_history)
+
+    def save_gui_config(
+        self,
+        device: Optional[str] = None,
+        devices: Optional[List[str]] = None,
+        input_history: Optional[List[str]] = None,
+    ) -> None:
+        """保存 GUI 侧配置。device/devices/input_history 由 GUI 提供。"""
+        with self._lock:
+            cur_device = (device or self._device).strip()
+            if not cur_device:
+                return
+            devs = list(self._gui_history.get("devices", []))
+            if cur_device not in devs:
+                devs.append(cur_device)
+            self._gui_history["devices"] = devs
+            self._gui_history["last_device"] = cur_device
+            self._gui_history["last_charset"] = self._charset
+            self._gui_history["echo_send"] = self._echo_send
+            self._gui_history["hex_dump"] = self._hex_dump
+            if devices is not None:
+                self._gui_history["devices"] = devices
+            if input_history is not None:
+                self._gui_history["input_history"] = input_history
+            data = dict(self._gui_history)
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            with open(GUI_CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+        except Exception:
+            pass
+
+    def get_gui_devices(self) -> List[str]:
+        return list(self._gui_history.get("devices", []))
+
+    # ── Agent 配置持久化（独立文件） ──────────────────────────
+    def load_agent_config(self) -> Dict[str, Any]:
+        if os.path.exists(AGENT_CONFIG_FILE):
+            try:
+                with open(AGENT_CONFIG_FILE, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    def save_agent_config(self, config: Dict[str, Any]) -> None:
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            with open(AGENT_CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False, indent=4)
+        except Exception:
+            pass
+
+    # ── Agent 命令历史（独立文件） ────────────────────────────
+    def load_agent_history(self) -> List[str]:
+        if os.path.exists(AGENT_HISTORY_FILE):
+            try:
+                with open(AGENT_HISTORY_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, list):
+                        self._agent_history = [str(x) for x in data]
+                        return list(self._agent_history)
+            except Exception:
+                pass
+        return []
+
+    def save_agent_history(self) -> None:
+        try:
+            os.makedirs(CONFIG_DIR, exist_ok=True)
+            with open(AGENT_HISTORY_FILE, "w", encoding="utf-8") as f:
+                json.dump(self._agent_history, f, ensure_ascii=False, indent=4)
+        except Exception:
+            pass
+
+    def append_agent_history(self, command: str) -> None:
+        """记录一条 agent 命令（去重相邻、限长）。command 通常为 'method: 摘要'。"""
+        if not command:
+            return
+        with self._lock:
+            if not self._agent_history or self._agent_history[-1] != command:
+                self._agent_history.append(command)
+                if len(self._agent_history) > AGENT_HISTORY_LIMIT:
+                    self._agent_history.pop(0)
+
+    def get_agent_history(self, limit: int = 100) -> List[str]:
+        with self._lock:
+            return list(self._agent_history[-limit:])
+
+    def clear_agent_history(self) -> None:
+        with self._lock:
+            self._agent_history.clear()
+        self.save_agent_history()
+
+    # ── 关闭 ──────────────────────────────────────────────────
+    def close(self) -> None:
+        """彻底关闭：断开连接 + 清空订阅者。"""
+        try:
+            self.disconnect()
+        except Exception:
+            pass
+        with self._sub_lock:
+            self._subs.clear()

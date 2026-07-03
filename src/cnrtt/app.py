@@ -1,18 +1,24 @@
-"""cnrtt 的主程序模块，包含 RTTViewerApp 及其入口函数。"""
+"""cnrtt 的主程序模块，包含 RTTViewerApp 及其入口函数。
 
-import json
+本模块为表现层：仅负责 Tkinter 渲染与用户交互，所有 RTT 业务逻辑
+（连接/收发/配置）委托给 cnrtt.core.RTTCore。GUI 通过订阅 core 的事件
+总线刷新自身状态，与 AI agent 服务端处于平等地位。
+"""
+
 import os
 import queue
 import re
 import threading
-import time
 import tkinter as tk
 from tkinter import scrolledtext, ttk
 
-import pylink
-
-CONFIG_FILE = os.path.join(
-    os.path.expanduser("~"), ".cnrtt", "rtt_history.json"
+from cnrtt.core import (
+    EVENT_CONFIG,
+    EVENT_ERROR,
+    EVENT_OUTPUT,
+    EVENT_STATUS,
+    RTTCore,
+    RTTError,
 )
 
 # ANSI 颜色码到 RGB 颜色的映射
@@ -28,17 +34,16 @@ ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*m')
 
 
 class RTTViewerApp:
-    def __init__(self, root):
+    def __init__(self, root, core: RTTCore = None):
         self.root = root
         self.root.title("CN RTT Viewer (支持中文及色彩)")
         self.root.geometry("700x500")
 
-        self.jlink = None
-        self.rtt_thread = None
-        self.is_connected = False
-        self.msg_queue = queue.Queue()
+        # 业务核心：可由外部注入（GUI+agent 共享同一 core），否则自建
+        self.core = core if core is not None else RTTCore()
+        self._owns_core = core is None  # 关闭时决定是否销毁
 
-        # 加载历史记录
+        # 启动期加载 GUI 配置（设备历史等）
         self.history = self.load_history()
 
         # --- UI 布局 ---
@@ -97,15 +102,15 @@ class RTTViewerApp:
 
         # 显示发送选项
         self.echo_send_var = tk.BooleanVar(value=self.history.get("echo_send", False))
-        self.echo_send_cb = tk.Checkbutton(bottom_frame, text="显示发送", variable=self.echo_send_var, command=self.save_history)
+        self.echo_send_cb = tk.Checkbutton(bottom_frame, text="显示发送", variable=self.echo_send_var, command=self._on_gui_option_changed)
         self.echo_send_cb.pack(side=tk.LEFT, padx=5)
 
         # 显示原始数据（Hex Dump）选项
         self.hex_dump_var = tk.BooleanVar(value=self.history.get("hex_dump", False))
-        self.hex_dump_cb = tk.Checkbutton(bottom_frame, text="Hex", variable=self.hex_dump_var, command=self.save_history)
+        self.hex_dump_cb = tk.Checkbutton(bottom_frame, text="Hex", variable=self.hex_dump_var, command=self._on_gui_option_changed)
         self.hex_dump_cb.pack(side=tk.LEFT, padx=5)
 
-        # 输入历史记录
+        # 输入历史记录（GUI 侧，与 agent 历史分离）
         self.input_history = self.history.get("input_history", [])
         self.input_history_idx = -1  # -1 表示不在历史浏览中
 
@@ -115,13 +120,80 @@ class RTTViewerApp:
         self.current_style = None
 
         # 全局快捷键
-        root.bind("<F2>", lambda e: self.connect() if not self.is_connected else None)
-        root.bind("<F3>", lambda e: self.disconnect() if self.is_connected else None)
+        root.bind("<F2>", lambda e: self.connect() if not self.core.is_connected else None)
+        root.bind("<F3>", lambda e: self.disconnect() if self.core.is_connected else None)
         root.bind("<Alt-r>", lambda e: self.clear_output())
         root.bind("<Alt-R>", lambda e: self.clear_output())
 
-        # 启动UI更新轮询
-        self.process_queue()
+        # 订阅 core 事件：用线程安全队列把事件 marshal 回 Tk 主线程
+        self._event_queue: "queue.Queue" = queue.Queue()
+        self._sub_id = self.core.subscribe(self._on_core_event_threadsafe)
+        self._process_events()
+
+    # ── 事件回调（先入队列，主线程消费） ──────────────────────
+    def _on_core_event_threadsafe(self, event_type, payload):
+        """core 回调（可能在读取线程中调用），仅入队，不触碰 Tk。"""
+        try:
+            self._event_queue.put_nowait((event_type, payload))
+        except Exception:
+            pass
+
+    def _process_events(self):
+        """Tk 主线程轮询事件队列并刷新 GUI。"""
+        try:
+            while True:
+                event_type, payload = self._event_queue.get_nowait()
+                self._dispatch_event(event_type, payload)
+        except queue.Empty:
+            pass
+        self.root.after(50, self._process_events)
+
+    def _dispatch_event(self, event_type, payload):
+        if event_type == EVENT_OUTPUT:
+            self.append_output(payload.get("text", ""))
+        elif event_type == EVENT_STATUS:
+            self._refresh_connection_ui(payload.get("connected", False))
+        elif event_type == EVENT_CONFIG:
+            self._sync_config_from_core(payload)
+        elif event_type == EVENT_ERROR:
+            # 错误已通过 output 事件输出到文本框，此处无需额外处理
+            pass
+
+    def _refresh_connection_ui(self, connected):
+        if connected:
+            self.connect_btn.config(text="断开")
+            self.device_combo.config(state=tk.DISABLED)
+            self.iface_combo.config(state=tk.DISABLED)
+            self.charset_combo.config(state=tk.DISABLED)
+        else:
+            self.connect_btn.config(text="连接")
+            self.device_combo.config(state="normal")
+            self.iface_combo.config(state="readonly")
+            self.charset_combo.config(state="readonly")
+
+    def _sync_config_from_core(self, cfg):
+        """core 配置变更时同步 GUI 控件（避免触发循环，静默设置）。"""
+        try:
+            if "device" in cfg and cfg["device"] and self.device_var.get() != cfg["device"]:
+                self.device_var.set(cfg["device"])
+            if "iface" in cfg and cfg["iface"] and self.iface_var.get() != cfg["iface"]:
+                self.iface_var.set(cfg["iface"])
+            if "charset" in cfg and cfg["charset"] and self.charset_var.get() != cfg["charset"]:
+                self.charset_var.set(cfg["charset"])
+            if "echo_send" in cfg and self.echo_send_var.get() != cfg["echo_send"]:
+                self.echo_send_var.set(bool(cfg["echo_send"]))
+            if "hex_dump" in cfg and self.hex_dump_var.get() != cfg["hex_dump"]:
+                self.hex_dump_var.set(bool(cfg["hex_dump"]))
+        except Exception:
+            pass
+
+    def _on_gui_option_changed(self):
+        """GUI 复选框变化时同步到 core 并保存配置。"""
+        self.core.set_config(
+            echo_send=self.echo_send_var.get(),
+            hex_dump=self.hex_dump_var.get(),
+        )
+        self.save_history()
 
     def setup_color_tags(self):
         """配置 Tkinter 文本框的颜色 Tag"""
@@ -155,154 +227,49 @@ class RTTViewerApp:
         return "break"
 
     def load_history(self):
-        if os.path.exists(CONFIG_FILE):
-            try:
-                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception:
-                pass
-        return {"last_device": "STM32F407VE", "devices": ["STM32F407VE"]}
+        """从 core 加载 GUI 配置（设备历史等）。"""
+        return self.core.load_gui_config()
 
     def save_history(self):
-        current_device = self.device_var.get().strip()
-        if not current_device:
-            return
-
-        devices = self.history.get("devices", [])
-        if current_device not in devices:
-            devices.append(current_device)
-
-        self.history["devices"] = devices
-        self.history["last_device"] = current_device
-        self.history["last_charset"] = self.charset_var.get()
-        self.history["echo_send"] = self.echo_send_var.get()
-        self.history["hex_dump"] = self.hex_dump_var.get()
-        self.history["input_history"] = self.input_history
-
-        self.device_combo['values'] = devices
-
-        try:
-            os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-                json.dump(self.history, f, ensure_ascii=False, indent=4)
-        except Exception:
-            pass
+        """保存 GUI 配置到 ~/.cnrtt/rtt_history.json。"""
+        self.core.save_gui_config(
+            device=self.device_var.get(),
+            devices=list(self.history.get("devices", [])),
+            input_history=self.input_history,
+        )
+        # 同步设备下拉列表
+        self.device_combo['values'] = self.core.get_gui_devices()
 
     def toggle_connection(self):
-        if not self.is_connected:
+        if not self.core.is_connected:
             self.connect()
         else:
             self.disconnect()
 
     def connect(self):
         try:
-            self.jlink = pylink.JLink()
-            self.jlink.open()
-
-            iface = pylink.enums.JLinkInterfaces.SWD if self.iface_var.get() == "SWD" else pylink.enums.JLinkInterfaces.JTAG
-
-            try:
-                self.jlink.set_tif(iface)
-            except AttributeError:
-                pass
-
-            self.jlink.connect(self.device_var.get())
-            self.jlink.rtt_start()
-            time.sleep(0.2)
-
-            self.is_connected = True
-            self.connect_btn.config(text="断开")
-            self.device_combo.config(state=tk.DISABLED)
-            self.iface_combo.config(state=tk.DISABLED)
-            self.charset_combo.config(state=tk.DISABLED)
+            self.core.connect(
+                device=self.device_var.get(),
+                iface=self.iface_var.get(),
+                charset=self.charset_var.get(),
+            )
             self.save_history()
-
-            self.rtt_thread = threading.Thread(target=self.read_rtt_loop, daemon=True)
-            self.rtt_thread.start()
-
-            self.append_output("[系统] 连接成功，RTT 已启动。\n")
-
-        except Exception as e:
-            self.append_output(f"[系统错误] {str(e)}\n")
-            if self.jlink:
-                try:
-                    self.jlink.close()
-                except Exception:
-                    pass
+        except RTTError:
+            # 错误信息已通过事件输出到文本框
+            pass
 
     def disconnect(self):
-        self.is_connected = False
-        if self.rtt_thread:
-            self.rtt_thread.join(timeout=1.0)
-
-        if self.jlink:
-            try:
-                if self.jlink.connected():
-                    self.jlink.rtt_stop()
-                self.jlink.close()
-            except Exception:
-                pass
-            self.jlink = None
-
-        self.connect_btn.config(text="连接")
-        self.device_combo.config(state="normal")
-        self.iface_combo.config(state="readonly")
-        self.charset_combo.config(state="readonly")
-        self.append_output("[系统] 已断开连接。\n")
-
-    def read_rtt_loop(self):
-        charset = self.charset_var.get()
-        while self.is_connected and self.jlink:
-            try:
-                data = self.jlink.rtt_read(0, 1024)
-                if data:
-                    byte_data = bytes(data)
-                    if self.hex_dump_var.get():
-                        hex_str = ' '.join(f'{b:02X}' for b in byte_data)
-                        self.msg_queue.put(f"[HEX {len(byte_data)}B] {hex_str}\n")
-                    text = byte_data.decode(charset, errors='replace')
-                    self.msg_queue.put(text)
-            except Exception as e:
-                self.msg_queue.put(f"[读取错误] {str(e)}\n")
-                self.is_connected = False
-                break
-            threading.Event().wait(0.01)
+        try:
+            self.core.disconnect()
+        except RTTError:
+            pass
 
     def send_input(self, event=None):
-        if not self.is_connected or not self.jlink:
-            return
-
         text = self.input_entry.get()
         if not text:
             return
-
-        charset = self.charset_var.get()
-        send_data = (text + '\n').encode(charset, errors='replace')
-        total = len(send_data)
-
         try:
-            # 循环写入直到全部发送完毕（处理下行缓冲区满的情况）
-            offset = 0
-            retries = 0
-            data = list(send_data)
-            while offset < total:
-                written = self.jlink.rtt_write(0, data[offset:])
-                offset += written
-                if written == 0:
-                    if retries < 20:
-                        retries += 1
-                        time.sleep(0.01)
-                    else:
-                        break
-                else:
-                    retries = 0
-
-            # 回显发送内容到输出框
-            if self.echo_send_var.get():
-                if offset < total:
-                    self.append_output(f"[发送 {offset}/{total}B 截断] {text}\n")
-                else:
-                    self.append_output(f"[发送 {total}B] {text}\n")
+            self.core.send(text)
             # 添加到输入历史（去重、限长）
             if not self.input_history or self.input_history[-1] != text:
                 self.input_history.append(text)
@@ -310,8 +277,10 @@ class RTTViewerApp:
                     self.input_history.pop(0)
             self.input_history_idx = -1
             self.input_entry.delete(0, tk.END)
-        except Exception as e:
-            self.append_output(f"[发送错误] {str(e)}\n")
+            self.save_history()
+        except RTTError:
+            # 错误已通过事件输出
+            pass
 
     def input_history_up(self, event):
         """上箭头：浏览更早的历史记录"""
@@ -344,15 +313,6 @@ class RTTViewerApp:
             self.input_entry.delete(0, tk.END)
             self.input_entry.insert(0, getattr(self, '_temp_input', ''))
         return "break"
-
-    def process_queue(self):
-        try:
-            while True:
-                msg = self.msg_queue.get_nowait()
-                self.append_output(msg)
-        except queue.Empty:
-            pass
-        self.root.after(50, self.process_queue)
 
     def append_output(self, text):
         """向输出框添加文本，支持解析 ANSI 色彩转义码"""
@@ -413,12 +373,18 @@ class RTTViewerApp:
             self.current_style = None
 
     def on_closing(self):
-        self.disconnect()
+        try:
+            self.core.unsubscribe(self._sub_id)
+        except Exception:
+            pass
+        if self._owns_core:
+            self.core.close()
         self.root.destroy()
 
     def clear_output(self):
         """清空输出框"""
         self.output_text.delete("1.0", tk.END)
+        self.core.clear_output()
 
 
 def _set_window_icon(root):
