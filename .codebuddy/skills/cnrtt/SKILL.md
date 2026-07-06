@@ -1,27 +1,63 @@
 ---
 name: cnrtt
-description: This skill should be used when working with STM32 or other ARM Cortex-M embedded projects that use SEGGER RTT (Real-Time Transfer) for debugging. It enables AI agent to connect to J-Link debuggers, read RTT output from MCU, send commands to the target, and monitor real-time logs. Trigger when the user mentions RTT, J-Link, embedded debugging, STM32 logging, or needs to view/interact with MCU output.
+description: Use this skill when working with cnrtt, SEGGER RTT, J-Link, STM32 or other ARM Cortex-M embedded debugging workflows, especially when an AI agent needs to connect to the cnrtt agent server, read RTT logs, send commands to the target board, or discover target-side commands. The default target firmware supports the `k:help` RTT command for command discovery.
 ---
 
 # cnrtt - RTT Debugging Tool
 
 ## Overview
 
-cnrtt is a Python-based RTT (Real-Time Transfer) client for SEGGER J-Link debuggers. This skill enables CodeBuddy to interact with embedded targets via RTT, allowing reading of MCU logs, sending commands, and real-time monitoring during embedded development.
+cnrtt is a Python/Tkinter RTT (Real-Time Transfer) client for SEGGER J-Link debuggers. It provides a GUI for manual debugging and an embedded JSON-RPC agent server so CodeBuddy can share the same RTT connection with the human operator.
+
+Use this skill to:
+- Check whether the cnrtt agent server is listening.
+- Connect/disconnect a J-Link target.
+- Read RTT output and watch live logs.
+- Send target commands through RTT channel 0.
+- Discover target commands with the default `k:help` command.
 
 ## Prerequisites
 
 Before using this skill, ensure:
-1. **cnrtt is installed**: `pip install cnrtt` or install from local wheel
-2. **J-Link driver is installed** and accessible
-3. **cnrtt agent server is running** (start with one of these commands):
+1. **cnrtt is installed**: `pip install cnrtt`, install from local wheel, or run editable from this repo with `pip install -e .`.
+2. **J-Link driver is installed** and accessible.
+3. **cnrtt agent server is running**. Prefer the GUI switch for human-AI collaboration:
+   - Start cnrtt.
+   - In the main window, use the `AI Agent` enable-listening checkbox.
+   - Confirm the displayed listening port, normally `127.0.0.1:7000`.
+
+Command-line alternatives:
    ```bash
-   # Headless mode (recommended for AI agent)
+   # Headless mode
    python -m cnrtt --headless --port 7000
    
-   # GUI + agent server (human-AI collaboration)
+   # GUI with agent server enabled at startup
    python -m cnrtt --with-agent --port 7000
    ```
+
+On Windows, the provided `scripts/launch_cnrtt.vbs` and generated shortcuts use `pythonw.exe` through `wscript.exe` to avoid a black console window.
+
+## Default Target Discovery
+
+After connecting to the target, send `k:help` first unless the user gives a more specific command. The default target board firmware supports this command and should return the available command list.
+
+Preferred sequence:
+
+```python
+from cnrtt.agent_client import AgentClient
+
+c = AgentClient("127.0.0.1", 7000)
+c.call("connect", {"device": "STM32F407VE", "iface": "SWD", "charset": "UTF-8"})
+c.call("send", {"text": "k:help", "append_newline": True})
+result = c.call("get_output", {"limit": 200})
+c.close()
+```
+
+Using the bundled helper:
+
+```bash
+python .codebuddy/skills/cnrtt/scripts/cnrtt_helper.py target_help
+```
 
 ## Core Capabilities
 
@@ -54,9 +90,11 @@ Common device names: `STM32F103C8`, `STM32F407VE`, `STM32F429ZI`, `NRF52840_XXAA
 To send text to RTT channel 0:
 
 ```python
-c.call("send", {"text": "help", "append_newline": True})
-# Returns: {"bytes_sent": 5}
+c.call("send", {"text": "k:help", "append_newline": True})
+# Returns: {"bytes_sent": 7}
 ```
+
+Use `k:help` as the default first command to discover target-side commands.
 
 ### 4. Read RTT Output
 
@@ -106,11 +144,12 @@ c.call("disconnect")
 ### Embedded Debugging Session
 
 ```
-1. Start cnrtt agent server (headless mode)
+1. Start cnrtt and enable AI Agent listening in the GUI, or start headless mode
 2. Connect to target: connect(device="STM32F407VE")
-3. Reset MCU and observe boot logs via get_output()
-4. Send test commands and verify responses
-5. Disconnect when done
+3. Send default target discovery command: k:help
+4. Read the response via get_output() and identify available commands
+5. Send test commands and verify responses
+6. Disconnect when done
 ```
 
 ### Real-Time Log Monitoring
@@ -157,6 +196,9 @@ python scripts/cnrtt_helper.py connect --device STM32F407VE
 
 # Send command
 python scripts/cnrtt_helper.py send --text "led on"
+
+# Discover default target commands
+python scripts/cnrtt_helper.py target_help
 
 # Get output
 python scripts/cnrtt_helper.py get_output --limit 100

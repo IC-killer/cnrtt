@@ -10,6 +10,7 @@ Commands:
     connect         - Connect to target device
     disconnect      - Disconnect from target
     send            - Send text to RTT channel
+    target_help     - Send default target help command (k:help) and read response
     get_output      - Get RTT output
     watch           - Watch RTT output continuously
     config          - Get/set configuration
@@ -30,6 +31,7 @@ except ImportError:
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 7000
+DEFAULT_TARGET_HELP_COMMAND = "k:help"
 
 
 def cmd_status(args):
@@ -93,6 +95,32 @@ def cmd_send(args):
         
         result = client.call("send", params)
         print(json.dumps(result, indent=2, ensure_ascii=False))
+    except AgentError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    finally:
+        client.close()
+    return 0
+
+
+def cmd_target_help(args):
+    """Send the default target help command and print the response."""
+    client = AgentClient(args.host, args.port, token=args.token)
+    try:
+        send_result = client.call(
+            "send",
+            {"text": args.text, "append_newline": not args.no_newline},
+        )
+        if args.delay > 0:
+            time.sleep(args.delay)
+        output = client.call("get_output", {"limit": args.limit})
+        result = {"send": send_result, "output": output}
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+
+        if output.get("lines"):
+            print("\n--- Target Help ---")
+            for line in output["lines"]:
+                print(line, end="")
     except AgentError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
@@ -230,6 +258,20 @@ def main():
     p_send.add_argument("--text", required=True, help="Text to send")
     p_send.add_argument("--no-newline", action="store_true", help="Don't append newline")
     
+    # target_help
+    p_target_help = subparsers.add_parser(
+        "target_help",
+        help="Send the default target help command (k:help) and read response",
+    )
+    p_target_help.add_argument(
+        "--text",
+        default=DEFAULT_TARGET_HELP_COMMAND,
+        help="Target help command to send",
+    )
+    p_target_help.add_argument("--no-newline", action="store_true", help="Don't append newline")
+    p_target_help.add_argument("--delay", type=float, default=0.2, help="Seconds to wait before reading output")
+    p_target_help.add_argument("--limit", type=int, default=200, help="Max output entries to read")
+
     # get_output
     p_get = subparsers.add_parser("get_output", help="Get RTT output")
     p_get.add_argument("--since", type=int, help="Cursor to start from")
@@ -239,7 +281,7 @@ def main():
     # watch
     p_watch = subparsers.add_parser("watch", help="Watch RTT output continuously")
     p_watch.add_argument("--raw", action="store_true", help="Output raw JSON")
-    
+
     # config
     p_config = subparsers.add_parser("config", help="Get/set configuration")
     p_config.add_argument("--set", nargs="*", help="Set config: key=value key2=value2")
@@ -253,6 +295,7 @@ def main():
         "connect": cmd_connect,
         "disconnect": cmd_disconnect,
         "send": cmd_send,
+        "target_help": cmd_target_help,
         "get_output": cmd_get_output,
         "watch": cmd_watch,
         "config": cmd_config,

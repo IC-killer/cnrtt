@@ -21,6 +21,19 @@ python -m cnrtt --headless --port 7000 --agent-token MY_SECRET
 
 ## JSON-RPC Methods
 
+### default target command discovery
+After `connect`, send `k:help` unless the user gives a more specific target command. The default target board firmware supports `k:help` and should return the available command list.
+
+```json
+{"jsonrpc": "2.0", "id": 10, "method": "send", "params": {"text": "k:help", "append_newline": true}}
+```
+
+Then fetch recent output:
+
+```json
+{"jsonrpc": "2.0", "id": 11, "method": "get_output", "params": {"limit": 200}}
+```
+
 ### status
 Get current state.
 ```json
@@ -43,7 +56,7 @@ Disconnect from target.
 ### send
 Send text to RTT channel 0.
 ```json
-{"jsonrpc": "2.0", "id": 4, "method": "send", "params": {"text": "help", "append_newline": true}}
+{"jsonrpc": "2.0", "id": 4, "method": "send", "params": {"text": "k:help", "append_newline": true}}
 ```
 
 ### get_output
