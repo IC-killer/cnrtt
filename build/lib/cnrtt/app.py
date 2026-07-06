@@ -8,9 +8,9 @@
 import os
 import queue
 import re
-import threading
 import tkinter as tk
 from tkinter import scrolledtext, ttk
+from typing import Optional
 
 from cnrtt.core import (
     EVENT_CONFIG,
@@ -33,11 +33,33 @@ ANSI_COLORS = {
 ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*m')
 
 
+def _hide_console_window():
+    """Hide the Windows console when GUI is launched through python.exe."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)
+    except Exception:
+        pass
+
+
 class RTTViewerApp:
-    def __init__(self, root, core: RTTCore = None):
+    def __init__(
+        self,
+        root,
+        core: RTTCore = None,
+        agent_enabled: Optional[bool] = None,
+        agent_host: str = "127.0.0.1",
+        agent_port: Optional[int] = None,
+        agent_token: Optional[str] = None,
+    ):
         self.root = root
         self.root.title("CN RTT Viewer (支持中文及色彩)")
-        self.root.geometry("700x500")
+        self.root.geometry("760x540")
 
         # 业务核心：可由外部注入（GUI+agent 共享同一 core），否则自建
         self.core = core if core is not None else RTTCore()
@@ -45,6 +67,29 @@ class RTTViewerApp:
 
         # 启动期加载 GUI 配置（设备历史等）
         self.history = self.load_history()
+
+        # AI agent server 配置与运行状态。server 由 GUI 自己管理，避免单独
+        # 启动监听窗口；--with-agent 仅作为初始打开开关。
+        self._agent_server = None
+        self._agent_config = self.core.load_agent_config()
+        self._agent_host = str(
+            agent_host or self._agent_config.get("host", "127.0.0.1")
+        )
+        self._agent_token = (
+            agent_token if agent_token is not None else self._agent_config.get("token")
+        )
+        try:
+            saved_port = self._agent_config.get("port", 7000)
+            self._agent_port = self._parse_agent_port(
+                agent_port if agent_port is not None else saved_port
+            )
+        except ValueError:
+            self._agent_port = 7000
+        self._agent_autostart = bool(
+            self._agent_config.get("enabled", False)
+            if agent_enabled is None
+            else agent_enabled
+        )
 
         # --- UI 布局 ---
         # 顶部连接设置区
@@ -68,6 +113,42 @@ class RTTViewerApp:
 
         self.connect_btn = tk.Button(top_frame, text="连接", command=self.toggle_connection)
         self.connect_btn.grid(row=0, column=6, padx=10)
+
+        # AI agent server 控制区
+        agent_frame = tk.Frame(root, padx=10, pady=4)
+        agent_frame.pack(fill=tk.X)
+
+        tk.Label(agent_frame, text="AI Agent:").pack(side=tk.LEFT)
+        self.agent_enabled_var = tk.BooleanVar(value=False)
+        self.agent_toggle = tk.Checkbutton(
+            agent_frame,
+            text="启用监听",
+            variable=self.agent_enabled_var,
+            command=self.toggle_agent_server,
+        )
+        self.agent_toggle.pack(side=tk.LEFT, padx=(8, 12))
+
+        tk.Label(agent_frame, text="端口:").pack(side=tk.LEFT)
+        self.agent_port_var = tk.StringVar(value=str(self._agent_port))
+        validate_port = (root.register(self._validate_agent_port_chars), "%P")
+        self.agent_port_entry = tk.Entry(
+            agent_frame,
+            textvariable=self.agent_port_var,
+            width=8,
+            validate="key",
+            validatecommand=validate_port,
+        )
+        self.agent_port_entry.pack(side=tk.LEFT, padx=(5, 12))
+        self.agent_port_entry.bind("<Return>", self.apply_agent_port)
+        self.agent_port_entry.bind("<FocusOut>", self.apply_agent_port)
+
+        self.agent_status_var = tk.StringVar()
+        self.agent_status_label = tk.Label(
+            agent_frame,
+            textvariable=self.agent_status_var,
+            anchor="w",
+        )
+        self.agent_status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
         # 中部日志输出区
         mid_frame = tk.Frame(root, padx=10)
@@ -129,6 +210,143 @@ class RTTViewerApp:
         self._event_queue: "queue.Queue" = queue.Queue()
         self._sub_id = self.core.subscribe(self._on_core_event_threadsafe)
         self._process_events()
+        self._refresh_agent_ui()
+        if self._agent_autostart:
+            self.root.after(0, self.start_agent_server)
+
+    # ── AI agent server 控制 ─────────────────────────────────
+    @staticmethod
+    def _validate_agent_port_chars(value):
+        return value == "" or value.isdigit()
+
+    @staticmethod
+    def _parse_agent_port(value) -> int:
+        try:
+            port = int(str(value).strip())
+        except (TypeError, ValueError) as e:
+            raise ValueError("端口必须是 1-65535 的整数") from e
+        if port < 1 or port > 65535:
+            raise ValueError("端口必须是 1-65535 的整数")
+        return port
+
+    def _is_agent_server_running(self) -> bool:
+        return bool(self._agent_server and self._agent_server.is_running)
+
+    def _set_agent_status(self, text, state="stopped"):
+        self.agent_status_var.set(text)
+        colors = {
+            "running": "#1f7a1f",
+            "error": "#b00020",
+            "stopped": "#555555",
+        }
+        self.agent_status_label.config(fg=colors.get(state, "#555555"))
+
+    def _refresh_agent_ui(self):
+        running = self._is_agent_server_running()
+        self.agent_enabled_var.set(running)
+        if running:
+            self.agent_port_entry.config(state=tk.DISABLED)
+            self._set_agent_status(
+                f"监听中 {self._agent_host}:{self._agent_port}",
+                state="running",
+            )
+        else:
+            self.agent_port_entry.config(state=tk.NORMAL)
+            self._set_agent_status(
+                f"未监听，当前端口 {self.agent_port_var.get() or self._agent_port}",
+                state="stopped",
+            )
+
+    def _save_agent_config(self, enabled: Optional[bool] = None):
+        config = dict(self._agent_config)
+        config["host"] = self._agent_host
+        config["port"] = self._agent_port
+        if enabled is not None:
+            config["enabled"] = bool(enabled)
+        if self._agent_token:
+            config["token"] = self._agent_token
+        self._agent_config = config
+        self.core.save_agent_config(config)
+
+    def apply_agent_port(self, event=None):
+        if self._is_agent_server_running():
+            return "break"
+        try:
+            self._agent_port = self._parse_agent_port(self.agent_port_var.get())
+        except ValueError as e:
+            self._set_agent_status(str(e), state="error")
+            return "break"
+        self.agent_port_var.set(str(self._agent_port))
+        self._save_agent_config()
+        self._refresh_agent_ui()
+        return "break"
+
+    def toggle_agent_server(self):
+        if self.agent_enabled_var.get():
+            self.start_agent_server()
+        else:
+            self.stop_agent_server()
+
+    def start_agent_server(self):
+        if self._is_agent_server_running():
+            self._refresh_agent_ui()
+            return True
+        try:
+            port = self._parse_agent_port(self.agent_port_var.get())
+        except ValueError as e:
+            self.agent_enabled_var.set(False)
+            self._set_agent_status(str(e), state="error")
+            self._save_agent_config(enabled=False)
+            return False
+
+        try:
+            from cnrtt.agent_server import AgentServer
+
+            server = AgentServer(
+                self.core,
+                host=self._agent_host,
+                port=port,
+                token=self._agent_token,
+            )
+            server.start()
+        except Exception as e:
+            self._agent_server = None
+            self.agent_enabled_var.set(False)
+            self._agent_port = port
+            self.agent_port_var.set(str(port))
+            self._save_agent_config(enabled=False)
+            self._set_agent_status(f"启动失败: {e}", state="error")
+            self.append_output(f"[Agent] 启动失败: {e}\n")
+            return False
+
+        self._agent_server = server
+        self._agent_port = port
+        self.agent_port_var.set(str(port))
+        self._save_agent_config(enabled=True)
+        self._refresh_agent_ui()
+        self.append_output(
+            f"[Agent] server listening on {self._agent_host}:{self._agent_port}\n"
+        )
+        return True
+
+    def stop_agent_server(self, persist_config: bool = True, announce: bool = True):
+        was_running = self._is_agent_server_running()
+        if self._agent_server is not None:
+            try:
+                self._agent_server.stop()
+            except Exception:
+                pass
+        self._agent_server = None
+        self.agent_enabled_var.set(False)
+        if persist_config:
+            try:
+                self._agent_port = self._parse_agent_port(self.agent_port_var.get())
+            except ValueError:
+                pass
+            self._save_agent_config(enabled=False)
+        self._refresh_agent_ui()
+        if announce and was_running:
+            self.append_output("[Agent] server stopped.\n")
 
     # ── 事件回调（先入队列，主线程消费） ──────────────────────
     def _on_core_event_threadsafe(self, event_type, payload):
@@ -373,6 +591,7 @@ class RTTViewerApp:
             self.current_style = None
 
     def on_closing(self):
+        self.stop_agent_server(persist_config=False, announce=False)
         try:
             self.core.unsubscribe(self._sub_id)
         except Exception:
@@ -404,6 +623,7 @@ def _set_window_icon(root):
 
 def main():
     """cnrtt 命令行入口：启动 RTT Viewer GUI。"""
+    _hide_console_window()
     root = tk.Tk()
     _set_window_icon(root)
     app = RTTViewerApp(root)

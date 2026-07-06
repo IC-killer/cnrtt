@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-import threading
 from typing import Optional
 
 from cnrtt.core import RTTCore
@@ -72,17 +71,22 @@ def main(argv=None) -> int:
             return 0
 
         if args.with_agent:
-            # GUI + agent server，共享 core
-            server = _start_agent_server(
-                core, args.host, args.port, args.agent_token
-            )
+            # GUI + agent server，共享 core；server 由主窗口内嵌控件管理。
             import tkinter as tk
 
-            from cnrtt.app import RTTViewerApp, _set_window_icon
+            from cnrtt.app import RTTViewerApp, _hide_console_window, _set_window_icon
 
+            _hide_console_window()
             gui_root = tk.Tk()
             _set_window_icon(gui_root)
-            gui_app = RTTViewerApp(gui_root, core=core)
+            gui_app = RTTViewerApp(
+                gui_root,
+                core=core,
+                agent_enabled=True,
+                agent_host=args.host,
+                agent_port=args.port,
+                agent_token=args.agent_token,
+            )
             gui_root.protocol("WM_DELETE_WINDOW", gui_app.on_closing)
             gui_root.mainloop()
             return 0
@@ -90,8 +94,9 @@ def main(argv=None) -> int:
         # 默认纯 GUI（不启动 agent server，零端口占用）
         import tkinter as tk
 
-        from cnrtt.app import RTTViewerApp, _set_window_icon
+        from cnrtt.app import RTTViewerApp, _hide_console_window, _set_window_icon
 
+        _hide_console_window()
         gui_root = tk.Tk()
         _set_window_icon(gui_root)
         gui_app = RTTViewerApp(gui_root, core=core)
@@ -105,6 +110,10 @@ def main(argv=None) -> int:
             server.stop()
         if gui_app is not None:
             # on_closing 已由 protocol 触发；兜底清理
+            try:
+                gui_app.stop_agent_server(persist_config=False, announce=False)
+            except Exception:
+                pass
             try:
                 core.close()
             except Exception:

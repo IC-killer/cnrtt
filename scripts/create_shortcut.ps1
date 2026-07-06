@@ -2,9 +2,9 @@
 .SYNOPSIS
     Create Windows shortcuts (.lnk) for the cnrtt GUI tool.
 .DESCRIPTION
-    Finds the installed cnrtt-gui.exe (Python gui-scripts entry point)
-    and creates a .lnk shortcut on the user Desktop and in the Start Menu,
-    so the GUI can be launched by double-clicking without opening a terminal.
+    Creates .lnk shortcuts on the user Desktop and in the Start Menu.
+    The shortcuts use wscript.exe + launch_cnrtt.vbs so the GUI launches
+    without a console window.
 .PARAMETER Remove
     Switch to removal mode: only remove previously created shortcuts.
 .EXAMPLE
@@ -18,7 +18,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$targetName = 'cnrtt-gui.exe'
+$targetName = 'wscript.exe'
 $label      = 'cnrtt RTT Viewer'
 $desktopLnk = Join-Path ([Environment]::GetFolderPath('Desktop'))   'cnrtt.lnk'
 $startLnk   = Join-Path ([Environment]::GetFolderPath('Programs'))  'cnrtt.lnk'
@@ -37,21 +37,14 @@ if ($Remove) {
     return
 }
 
-# 1. Locate cnrtt-gui.exe: prefer PATH, else fall back to current Python Scripts dir
-$cmd = Get-Command $targetName -ErrorAction SilentlyContinue
-$cmdSource = $null
-if (-not $cmd) {
-    $pyExe = (Get-Command python -ErrorAction SilentlyContinue).Source
-    if ($pyExe) {
-        $scriptsDir = Join-Path (Split-Path $pyExe -Parent) 'Scripts'
-        $candidate  = Join-Path $scriptsDir $targetName
-        if (Test-Path -LiteralPath $candidate) { $cmdSource = $candidate }
-    }
-    if (-not $cmdSource) {
-        throw 'cnrtt-gui.exe not found. Run: pip install .  first.'
-    }
-} else {
-    $cmdSource = $cmd.Source
+# 1. Locate wscript.exe and the no-console launcher script.
+$cmdSource = Join-Path $env:WINDIR 'System32\wscript.exe'
+if (-not (Test-Path -LiteralPath $cmdSource)) {
+    throw ('wscript.exe not found: ' + $cmdSource)
+}
+$launcher = Join-Path $PSScriptRoot 'launch_cnrtt.vbs'
+if (-not (Test-Path -LiteralPath $launcher)) {
+    throw ('launch_cnrtt.vbs not found: ' + $launcher)
 }
 
 # 1b. Locate the bundled icon: <site-packages>\cnrtt\assets\cnrtt.ico
@@ -77,11 +70,11 @@ $wsh = New-Object -ComObject WScript.Shell
 foreach ($lnk in @($desktopLnk, $startLnk)) {
     $s = $wsh.CreateShortcut($lnk)
     $s.TargetPath       = $cmdSource
+    $s.Arguments        = '"' + $launcher + '"'
     $s.WorkingDirectory = Split-Path $cmdSource -Parent
     if ($iconPath) { $s.IconLocation = $iconPath + ',0' }
     $s.Description      = $label
-    # 7 = Minimized; the console flashes briefly then the GUI shows on its own.
-    $s.WindowStyle      = 7
+    $s.WindowStyle      = 1
     $s.Save()
     Write-Host ("Created: " + $lnk + "  ->  " + $cmdSource)
 }

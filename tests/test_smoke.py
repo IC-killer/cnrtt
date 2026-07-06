@@ -5,6 +5,7 @@ from unittest import mock
 
 import cnrtt
 from cnrtt.app import RTTViewerApp
+from cnrtt.core import RTTCore
 
 
 def test_version():
@@ -25,7 +26,8 @@ def test_gui_components():
     root = tk.Tk()
     try:
         with mock.patch.object(RTTViewerApp, 'load_history', return_value={"last_device": "STM32F407VE", "devices": ["STM32F407VE"]}):
-            app = RTTViewerApp(root)
+            with mock.patch.object(RTTCore, "load_agent_config", return_value={}):
+                app = RTTViewerApp(root)
 
         # 字符集下拉框
         assert hasattr(app, "charset_var")
@@ -51,5 +53,51 @@ def test_gui_components():
         # 清屏方法
         assert hasattr(app, "clear_output")
         assert callable(app.clear_output)
+
+        # AI agent server 控件
+        assert hasattr(app, "agent_status_var")
+        assert hasattr(app, "agent_port_var")
+        assert hasattr(app, "agent_toggle")
+        assert app.agent_port_var.get() == "7000"
+        assert "未监听" in app.agent_status_var.get()
+    finally:
+        root.destroy()
+
+
+def test_agent_server_controls_start_stop():
+    """主窗口应能内嵌启动/停止 agent server。"""
+    root = tk.Tk()
+    try:
+        server = mock.MagicMock()
+        server.is_running = True
+        with mock.patch.object(RTTViewerApp, 'load_history', return_value={"last_device": "STM32F407VE", "devices": ["STM32F407VE"]}):
+            with mock.patch.object(RTTCore, "load_agent_config", return_value={}):
+                with mock.patch.object(RTTCore, "save_agent_config") as save_agent_config:
+                    with mock.patch("cnrtt.agent_server.AgentServer", return_value=server) as server_cls:
+                        app = RTTViewerApp(root)
+                        app.agent_port_var.set("8123")
+
+                        assert app.start_agent_server() is True
+                        server_cls.assert_called_once_with(
+                            app.core,
+                            host="127.0.0.1",
+                            port=8123,
+                            token=None,
+                        )
+                        server.start.assert_called_once()
+                        assert app.agent_enabled_var.get() is True
+                        assert "127.0.0.1:8123" in app.agent_status_var.get()
+                        assert app.agent_port_entry.cget("state") == tk.DISABLED
+                        saved_config = save_agent_config.call_args[0][-1]
+                        assert saved_config["enabled"] is True
+                        assert saved_config["port"] == 8123
+
+                        app.stop_agent_server()
+                        server.stop.assert_called_once()
+                        assert app.agent_enabled_var.get() is False
+                        assert "未监听" in app.agent_status_var.get()
+                        assert app.agent_port_entry.cget("state") == tk.NORMAL
+                        saved_config = save_agent_config.call_args[0][-1]
+                        assert saved_config["enabled"] is False
     finally:
         root.destroy()
