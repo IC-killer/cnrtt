@@ -74,9 +74,15 @@ def main(argv=None) -> int:
             # GUI + agent server，共享 core；server 由主窗口内嵌控件管理。
             import tkinter as tk
 
-            from cnrtt.app import RTTViewerApp, _hide_console_window, _set_window_icon
+            from cnrtt.app import (
+                RTTViewerApp,
+                _hide_console_window,
+                _set_window_icon,
+                _set_windows_app_user_model_id,
+            )
 
             _hide_console_window()
+            _set_windows_app_user_model_id()
             gui_root = tk.Tk()
             _set_window_icon(gui_root)
             gui_app = RTTViewerApp(
@@ -94,9 +100,15 @@ def main(argv=None) -> int:
         # 默认纯 GUI（不启动 agent server，零端口占用）
         import tkinter as tk
 
-        from cnrtt.app import RTTViewerApp, _hide_console_window, _set_window_icon
+        from cnrtt.app import (
+            RTTViewerApp,
+            _hide_console_window,
+            _set_window_icon,
+            _set_windows_app_user_model_id,
+        )
 
         _hide_console_window()
+        _set_windows_app_user_model_id()
         gui_root = tk.Tk()
         _set_window_icon(gui_root)
         gui_app = RTTViewerApp(gui_root, core=core)

@@ -5,7 +5,10 @@ glyph and a small green signal wave at the bottom, evoking RTT real-time
 transfer with Chinese support.
 
 Run:  python scripts/make_icon.py
-Output: src/cnrtt/assets/cnrtt.ico  (16, 32, 48, 256 px)
+Output:
+  - src/cnrtt/assets/cnrtt.ico      (16, 32, 48, 256 px; shortcut/Explorer)
+  - src/cnrtt/assets/cnrtt-32.png   (Tk window/taskbar)
+  - src/cnrtt/assets/cnrtt-48.png   (Tk window/taskbar)
 """
 from __future__ import annotations
 
@@ -16,6 +19,8 @@ from PIL import Image, ImageDraw, ImageFont
 
 OUT_DIR = os.path.join("src", "cnrtt", "assets")
 OUT_ICO = os.path.join(OUT_DIR, "cnrtt.ico")
+OUT_PNG_32 = os.path.join(OUT_DIR, "cnrtt-32.png")
+OUT_PNG_48 = os.path.join(OUT_DIR, "cnrtt-48.png")
 SIZES = [16, 32, 48, 256]
 
 
@@ -111,7 +116,11 @@ def render(size: int) -> Image.Image:
 
 def main() -> None:
     os.makedirs(OUT_DIR, exist_ok=True)
-    images = [render(sz) for sz in SIZES]
+    rendered = {sz: render(sz) for sz in SIZES}
+    rendered[32].save(OUT_PNG_32)
+    rendered[48].save(OUT_PNG_48)
+
+    images = list(rendered.values())
     # Largest first so Windows Explorer picks the best quality thumbnail.
     images.sort(key=lambda im: im.width, reverse=True)
     images[0].save(
@@ -123,6 +132,8 @@ def main() -> None:
     print(f"Wrote {OUT_ICO}")
     for im in images:
         print(f"  - {im.width}x{im.height}")
+    print(f"Wrote {OUT_PNG_32}")
+    print(f"Wrote {OUT_PNG_48}")
 
 
 if __name__ == "__main__":

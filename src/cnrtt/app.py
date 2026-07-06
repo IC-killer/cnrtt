@@ -32,6 +32,8 @@ ANSI_COLORS = {
 # 匹配 ANSI 颜色转义序列 (如 \x1b[1;36m)
 ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*m')
 
+APP_USER_MODEL_ID = "cnrtt.rttviewer"
+
 
 def _hide_console_window():
     """Hide the Windows console when GUI is launched through python.exe."""
@@ -43,6 +45,18 @@ def _hide_console_window():
         hwnd = ctypes.windll.kernel32.GetConsoleWindow()
         if hwnd:
             ctypes.windll.user32.ShowWindow(hwnd, 0)
+    except Exception:
+        pass
+
+
+def _set_windows_app_user_model_id(app_id: str = APP_USER_MODEL_ID):
+    """Set the Windows taskbar identity before creating the Tk window."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
     except Exception:
         pass
 
@@ -609,21 +623,37 @@ class RTTViewerApp:
 def _set_window_icon(root):
     """为窗口设置任务栏/标题栏图标。
 
-    优先使用包内 assets/cnrtt.ico（已随安装包分发），
+    优先使用包内 32/48px PNG，避免 Tk/Windows 从多尺寸 .ico 中
+    选到 256px 图层后在任务栏出现裁剪；.ico 仅作为 fallback。
     找不到时静默跳过，不影响启动。
     """
     try:
         from importlib.resources import files
-        ico_path = files("cnrtt").joinpath("assets", "cnrtt.ico")
-        root.iconbitmap(default=str(ico_path))
+
+        assets = files("cnrtt").joinpath("assets")
+        png32 = str(assets.joinpath("cnrtt-32.png"))
+        png48 = str(assets.joinpath("cnrtt-48.png"))
+        icon32 = tk.PhotoImage(file=png32)
+        icon48 = tk.PhotoImage(file=png48)
+        # Keep references alive; Tk images are garbage-collected otherwise.
+        root._cnrtt_icon_images = (icon32, icon48)
+        root.iconphoto(True, icon32, icon48)
     except Exception:
-        # 任何失败（缺文件、Tk 不支持、资源未安装）都不阻断启动
-        pass
+        try:
+            from importlib.resources import files
+
+            ico_path = str(files("cnrtt").joinpath("assets", "cnrtt.ico"))
+            root.iconbitmap(ico_path)
+            root.iconbitmap(default=ico_path)
+        except Exception:
+            # 任何失败（缺文件、Tk 不支持、资源未安装）都不阻断启动
+            pass
 
 
 def main():
     """cnrtt 命令行入口：启动 RTT Viewer GUI。"""
     _hide_console_window()
+    _set_windows_app_user_model_id()
     root = tk.Tk()
     _set_window_icon(root)
     app = RTTViewerApp(root)

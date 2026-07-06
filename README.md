@@ -85,6 +85,24 @@ Windows 桌面快捷方式使用 `scripts/launch_cnrtt.vbs` 通过 `pythonw.exe`
 pwsh -File scripts\create_shortcut.ps1
 ```
 
+#### 手动更换图标
+
+cnrtt 分开使用桌面快捷方式图标和 Tk 窗口/任务栏图标：
+
+- 桌面/开始菜单快捷方式图标：替换 `src/cnrtt/assets/cnrtt.ico`
+- 窗口/任务栏图标：替换 `src/cnrtt/assets/cnrtt-32.png` 和 `src/cnrtt/assets/cnrtt-48.png`
+
+推荐准备一个完整的多尺寸 `.ico`（至少包含 16/32/48/256 px），并准备 32x32、48x48 两张 PNG。替换后执行：
+
+```powershell
+Copy-Item src\cnrtt\assets\cnrtt.ico build\lib\cnrtt\assets\cnrtt.ico
+Copy-Item src\cnrtt\assets\cnrtt-32.png build\lib\cnrtt\assets\cnrtt-32.png
+Copy-Item src\cnrtt\assets\cnrtt-48.png build\lib\cnrtt\assets\cnrtt-48.png
+pwsh -File scripts\create_shortcut.ps1
+```
+
+如果使用 `scripts/make_icon.py` 重新生成内置图标，它会同时输出 `cnrtt.ico`、`cnrtt-32.png` 和 `cnrtt-48.png`。Windows 可能缓存快捷方式图标；替换后如果桌面图标未立即变化，先删除旧快捷方式再运行 `create_shortcut.ps1`，或重新登录 Windows。
+
 ### AI 调试默认流程
 
 默认目标板固件支持 `k:help` 指令。连接成功后，AI Agent 应优先发送 `k:help` 获取目标侧命令列表，再根据返回内容继续调试。
