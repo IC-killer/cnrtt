@@ -9,7 +9,8 @@ import os
 import queue
 import re
 import tkinter as tk
-from tkinter import scrolledtext, ttk
+from datetime import datetime
+from tkinter import filedialog, scrolledtext, ttk
 from typing import Optional
 
 from cnrtt.core import (
@@ -337,6 +338,31 @@ class RTTViewerApp:
         mid_frame = tk.Frame(root, padx=10)
         mid_frame.pack(fill=tk.BOTH, expand=True)
 
+        output_toolbar = tk.Frame(mid_frame)
+        output_toolbar.pack(fill=tk.X, pady=(0, 4))
+
+        self.clear_output_btn = tk.Button(
+            output_toolbar,
+            text="清空",
+            command=self.clear_output,
+        )
+        self.clear_output_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.save_output_btn = tk.Button(
+            output_toolbar,
+            text="保存",
+            command=self.save_output,
+        )
+        self.save_output_btn.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.pause_scroll_btn = tk.Button(
+            output_toolbar,
+            text="暂停滚动",
+            command=self.toggle_output_scroll,
+        )
+        self.pause_scroll_btn.pack(side=tk.LEFT)
+        self.output_scroll_paused = False
+
         self.output_text = scrolledtext.ScrolledText(mid_frame, wrap=tk.WORD, font=("Consolas", 10), bg="#1e1e1e", fg="#d4d4d4")
         self.output_text.pack(fill=tk.BOTH, expand=True)
 
@@ -388,16 +414,28 @@ class RTTViewerApp:
         root.bind("<F3>", lambda e: self.disconnect() if self.core.is_connected else None)
         root.bind("<Alt-r>", lambda e: self.clear_output())
         root.bind("<Alt-R>", lambda e: self.clear_output())
+        root.bind("<Activate>", self._on_window_activated)
 
         # 订阅 core 事件：用线程安全队列把事件 marshal 回 Tk 主线程
         self._event_queue: "queue.Queue" = queue.Queue()
         self._sub_id = self.core.subscribe(self._on_core_event_threadsafe)
         self._process_events()
         self._refresh_agent_ui()
+        self.root.after(0, self._focus_input)
         if self._agent_autostart:
             self.root.after(0, self.start_agent_server)
 
     # ── AI agent server 控制 ─────────────────────────────────
+    def _focus_input(self):
+        try:
+            self.input_entry.focus_set()
+            self.input_entry.icursor(tk.END)
+        except Exception:
+            pass
+
+    def _on_window_activated(self, event=None):
+        self.root.after(0, self._focus_input)
+
     @staticmethod
     def _validate_agent_port_chars(value):
         return value == "" or value.isdigit()
@@ -746,7 +784,8 @@ class RTTViewerApp:
             if i < len(codes):
                 self.parse_ansi_code(codes[i])
 
-        self.output_text.see(tk.END)
+        if not self.output_scroll_paused:
+            self.output_text.see(tk.END)
 
     def parse_ansi_code(self, code_str):
         """解析 ANSI 颜色控制码并更新当前样式"""
@@ -786,7 +825,48 @@ class RTTViewerApp:
     def clear_output(self):
         """清空输出框"""
         self.output_text.delete("1.0", tk.END)
-        self.core.clear_output()
+        self.ansi_buffer = ""
+        self.current_style = None
+        self.core.clear_output(announce=False)
+
+    def save_output(self):
+        """保存输出框内容到文本文件。"""
+        default_name = "cnrtt-output-" + datetime.now().strftime("%Y%m%d-%H%M%S") + ".txt"
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="保存输出",
+            defaultextension=".txt",
+            initialfile=default_name,
+            filetypes=[
+                ("Text files", "*.txt"),
+                ("Log files", "*.log"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return None
+
+        text = self.output_text.get("1.0", "end-1c")
+        try:
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+        except OSError as e:
+            self.append_output(f"[GUI] 保存输出失败: {e}\n")
+            return None
+
+        self.append_output(f"[GUI] 输出已保存: {path}\n")
+        return path
+
+    def toggle_output_scroll(self):
+        """暂停/恢复输出框自动滚动。"""
+        self.output_scroll_paused = not self.output_scroll_paused
+        if self.output_scroll_paused:
+            self.pause_scroll_btn.config(text="恢复滚动")
+        else:
+            self.pause_scroll_btn.config(text="暂停滚动")
+            self.output_text.see(tk.END)
+        self._focus_input()
+        return "break"
 
 
 def _set_window_icon(root):

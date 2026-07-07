@@ -328,11 +328,12 @@ class RTTCore:
                     self._output_buf.popleft()
             return lines, next_cursor
 
-    def clear_output(self) -> None:
+    def clear_output(self, announce: bool = True) -> None:
         with self._output_lock:
             self._output_buf.clear()
             # seq 继续递增，避免 since=0 的旧客户端重复取到旧数据语义混乱
-        self._emit_output("[系统] 输出已清空。\n")
+        if announce:
+            self._emit_output("[系统] 输出已清空。\n")
 
     # ── 配置 ──────────────────────────────────────────────────
     def get_config(self) -> Dict[str, Any]:

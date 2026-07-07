@@ -53,6 +53,24 @@ def test_gui_components():
         # 清屏方法
         assert hasattr(app, "clear_output")
         assert callable(app.clear_output)
+        assert hasattr(app, "clear_output_btn")
+        assert hasattr(app, "save_output_btn")
+        assert hasattr(app, "pause_scroll_btn")
+        assert app.pause_scroll_btn.cget("text") == "暂停滚动"
+        assert app.output_scroll_paused is False
+
+        app.toggle_output_scroll()
+        assert app.output_scroll_paused is True
+        assert app.pause_scroll_btn.cget("text") == "恢复滚动"
+        app.toggle_output_scroll()
+        assert app.output_scroll_paused is False
+        assert app.pause_scroll_btn.cget("text") == "暂停滚动"
+
+        app.output_text.insert(tk.END, "old output")
+        with mock.patch.object(app.core, "clear_output") as clear_output:
+            app.clear_output()
+            clear_output.assert_called_once_with(announce=False)
+        assert app.output_text.get("1.0", "end-1c") == ""
 
         # AI agent server 控件
         assert hasattr(app, "agent_status_var")
@@ -60,6 +78,24 @@ def test_gui_components():
         assert hasattr(app, "agent_toggle")
         assert app.agent_port_var.get() == "7000"
         assert "未监听" in app.agent_status_var.get()
+    finally:
+        root.destroy()
+
+
+def test_save_output_writes_text_file(tmp_path):
+    """保存输出按钮应把当前输出框内容写入文本文件。"""
+    root = tk.Tk()
+    try:
+        output_path = tmp_path / "cnrtt-output.txt"
+        with mock.patch.object(RTTViewerApp, 'load_history', return_value={"last_device": "STM32F407VE", "devices": ["STM32F407VE"]}):
+            with mock.patch.object(RTTCore, "load_agent_config", return_value={}):
+                with mock.patch("cnrtt.app.filedialog.asksaveasfilename", return_value=str(output_path)):
+                    app = RTTViewerApp(root)
+                    app.output_text.insert(tk.END, "hello\nworld")
+
+                    assert app.save_output() == str(output_path)
+
+        assert output_path.read_text(encoding="utf-8") == "hello\nworld"
     finally:
         root.destroy()
 
