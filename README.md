@@ -85,6 +85,8 @@ Windows 桌面快捷方式使用 `scripts/launch_cnrtt.vbs` 通过 `pythonw.exe`
 pwsh -File scripts\create_shortcut.ps1
 ```
 
+如果任务栏已固定成 Python 默认图标，先在任务栏取消固定旧图标，再运行上面的脚本重新生成快捷方式，然后从新的桌面/开始菜单快捷方式启动或固定。脚本会给快捷方式写入 `cnrtt.rttviewer` AppUserModelID，应用启动时也会给窗口写入同一个任务栏 ID 和重启图标。
+
 #### 手动更换图标
 
 cnrtt 分开使用桌面快捷方式图标和 Tk 窗口/任务栏图标：

@@ -33,6 +33,7 @@ ANSI_COLORS = {
 ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*m')
 
 APP_USER_MODEL_ID = "cnrtt.rttviewer"
+APP_DISPLAY_NAME = "cnrtt RTT Viewer"
 
 
 def _hide_console_window():
@@ -59,6 +60,174 @@ def _set_windows_app_user_model_id(app_id: str = APP_USER_MODEL_ID):
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
     except Exception:
         pass
+
+
+def _windows_gui_python_executable() -> str:
+    """Return pythonw.exe when available so taskbar relaunch stays console-free."""
+    import sys
+
+    exe = sys.executable
+    if os.name == "nt" and os.path.basename(exe).lower() == "python.exe":
+        pythonw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+        if os.path.exists(pythonw):
+            return pythonw
+    return exe
+
+
+def _windows_relaunch_command(relaunch_args=None) -> str:
+    import subprocess
+    import sys
+
+    args = list(sys.argv[1:] if relaunch_args is None else relaunch_args)
+    return subprocess.list2cmdline([_windows_gui_python_executable(), "-m", "cnrtt", *args])
+
+
+def _package_icon_path() -> Optional[str]:
+    try:
+        from importlib.resources import files
+
+        icon_path = str(files("cnrtt").joinpath("assets", "cnrtt.ico"))
+        return icon_path if os.path.exists(icon_path) else None
+    except Exception:
+        return None
+
+
+def _set_windows_taskbar_relaunch_metadata(
+    root,
+    app_id: str = APP_USER_MODEL_ID,
+    relaunch_args=None,
+) -> bool:
+    """Tell Windows what command/icon to use when this Tk window is pinned."""
+    if os.name != "nt":
+        return False
+
+    try:
+        import ctypes
+        import uuid
+        from ctypes import wintypes
+
+        HRESULT = ctypes.c_long
+
+        class GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", wintypes.DWORD),
+                ("Data2", wintypes.WORD),
+                ("Data3", wintypes.WORD),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+        class PROPERTYKEY(ctypes.Structure):
+            _fields_ = [("fmtid", GUID), ("pid", wintypes.DWORD)]
+
+        class PROPVARIANT_UNION(ctypes.Union):
+            _fields_ = [("pwszVal", wintypes.LPWSTR), ("ptr", ctypes.c_void_p)]
+
+        class PROPVARIANT(ctypes.Structure):
+            _fields_ = [
+                ("vt", ctypes.c_ushort),
+                ("wReserved1", ctypes.c_ushort),
+                ("wReserved2", ctypes.c_ushort),
+                ("wReserved3", ctypes.c_ushort),
+                ("value", PROPVARIANT_UNION),
+            ]
+
+        def guid(value: str) -> GUID:
+            return GUID.from_buffer_copy(uuid.UUID(value).bytes_le)
+
+        def check_hresult(hr):
+            signed = ctypes.c_long(hr).value
+            if signed < 0:
+                raise OSError(signed)
+
+        root.update_idletasks()
+        hwnd = int(root.winfo_id())
+        if not hwnd:
+            return False
+
+        shell32 = ctypes.windll.shell32
+        ole32 = ctypes.windll.ole32
+
+        shell32.SHGetPropertyStoreForWindow.argtypes = [
+            wintypes.HWND,
+            ctypes.POINTER(GUID),
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        shell32.SHGetPropertyStoreForWindow.restype = HRESULT
+        ole32.CoTaskMemAlloc.argtypes = [ctypes.c_size_t]
+        ole32.CoTaskMemAlloc.restype = ctypes.c_void_p
+        ole32.PropVariantClear.argtypes = [ctypes.POINTER(PROPVARIANT)]
+        ole32.PropVariantClear.restype = HRESULT
+
+        def propvariant_from_string(value: str) -> PROPVARIANT:
+            prop = PROPVARIANT()
+            text = str(value) + "\0"
+            size = len(text) * ctypes.sizeof(ctypes.c_wchar)
+            ptr = ole32.CoTaskMemAlloc(size)
+            if not ptr:
+                raise MemoryError("CoTaskMemAlloc failed")
+            ctypes.memmove(ptr, ctypes.create_unicode_buffer(text), size)
+            prop.vt = 31  # VT_LPWSTR
+            prop.value.ptr = ptr
+            return prop
+
+        property_store = ctypes.c_void_p()
+        iid_property_store = guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99")
+        check_hresult(
+            shell32.SHGetPropertyStoreForWindow(
+                wintypes.HWND(hwnd),
+                ctypes.byref(iid_property_store),
+                ctypes.byref(property_store),
+            )
+        )
+        if not property_store.value:
+            return False
+
+        try:
+            vtbl = ctypes.cast(
+                property_store,
+                ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)),
+            ).contents
+            set_value = ctypes.WINFUNCTYPE(
+                HRESULT,
+                ctypes.c_void_p,
+                ctypes.POINTER(PROPERTYKEY),
+                ctypes.POINTER(PROPVARIANT),
+            )(vtbl[6])
+            commit = ctypes.WINFUNCTYPE(HRESULT, ctypes.c_void_p)(vtbl[7])
+            release = ctypes.WINFUNCTYPE(wintypes.ULONG, ctypes.c_void_p)(vtbl[2])
+
+            pkey_app_user_model = guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3")
+
+            def set_string_property(pid: int, value: Optional[str]):
+                if not value:
+                    return
+                key = PROPERTYKEY(pkey_app_user_model, pid)
+                prop = propvariant_from_string(value)
+                try:
+                    check_hresult(
+                        set_value(property_store.value, ctypes.byref(key), ctypes.byref(prop))
+                    )
+                finally:
+                    ole32.PropVariantClear(ctypes.byref(prop))
+
+            icon_path = _package_icon_path()
+            set_string_property(5, app_id)
+            set_string_property(2, _windows_relaunch_command(relaunch_args))
+            set_string_property(3, f"{icon_path},0" if icon_path else None)
+            set_string_property(4, APP_DISPLAY_NAME)
+            check_hresult(commit(property_store.value))
+        finally:
+            try:
+                release(property_store.value)
+            except Exception:
+                pass
+        return True
+    except Exception:
+        if os.environ.get("CNRRT_DEBUG_TASKBAR_ICON") == "1":
+            import traceback
+
+            traceback.print_exc()
+        return False
 
 
 class RTTViewerApp:
@@ -656,6 +825,7 @@ def main():
     _set_windows_app_user_model_id()
     root = tk.Tk()
     _set_window_icon(root)
+    _set_windows_taskbar_relaunch_metadata(root)
     app = RTTViewerApp(root)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
     root.mainloop()

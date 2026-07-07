@@ -77,6 +77,7 @@ def main(argv=None) -> int:
             from cnrtt.app import (
                 RTTViewerApp,
                 _hide_console_window,
+                _set_windows_taskbar_relaunch_metadata,
                 _set_window_icon,
                 _set_windows_app_user_model_id,
             )
@@ -85,6 +86,10 @@ def main(argv=None) -> int:
             _set_windows_app_user_model_id()
             gui_root = tk.Tk()
             _set_window_icon(gui_root)
+            _set_windows_taskbar_relaunch_metadata(
+                gui_root,
+                relaunch_args=argv if argv is not None else sys.argv[1:],
+            )
             gui_app = RTTViewerApp(
                 gui_root,
                 core=core,
@@ -103,6 +108,7 @@ def main(argv=None) -> int:
         from cnrtt.app import (
             RTTViewerApp,
             _hide_console_window,
+            _set_windows_taskbar_relaunch_metadata,
             _set_window_icon,
             _set_windows_app_user_model_id,
         )
@@ -111,6 +117,10 @@ def main(argv=None) -> int:
         _set_windows_app_user_model_id()
         gui_root = tk.Tk()
         _set_window_icon(gui_root)
+        _set_windows_taskbar_relaunch_metadata(
+            gui_root,
+            relaunch_args=argv if argv is not None else sys.argv[1:],
+        )
         gui_app = RTTViewerApp(gui_root, core=core)
         gui_root.protocol("WM_DELETE_WINDOW", gui_app.on_closing)
         gui_root.mainloop()
