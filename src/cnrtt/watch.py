@@ -49,6 +49,8 @@ TYPE_ALIASES = {
 }
 
 SHF_ALLOC = 0x2
+MAX_DWARF_ARRAY_ELEMENTS = 256
+MAX_DWARF_EXPANSION_DEPTH = 6
 
 
 def normalize_value_type(value_type: str) -> str:
@@ -105,8 +107,12 @@ class WatchItem:
     source: str = "manual"
     item_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     last_value: str = ""
+    last_raw: str = ""
     last_error: str = ""
     updated_at: float = 0.0
+    latency_ms: float = 0.0
+    read_count: int = 0
+    fail_count: int = 0
     next_due: float = 0.0
 
     def __post_init__(self):
@@ -132,8 +138,12 @@ class WatchItem:
             data.update(
                 {
                     "value": self.last_value,
+                    "raw": self.last_raw,
                     "error": self.last_error,
                     "updated_at": self.updated_at,
+                    "latency_ms": self.latency_ms,
+                    "read_count": self.read_count,
+                    "fail_count": self.fail_count,
                 }
             )
         return data
@@ -157,15 +167,28 @@ class AxfSymbol:
     address: int
     value_type: str = "u32"
     size: int = 4
+    kind: str = "scalar"
+    parent: str = ""
+    path: str = ""
+    detail: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        data = {
             "name": self.name,
             "address": self.address,
             "address_hex": f"0x{self.address:08X}",
             "type": self.value_type,
             "size": self.size,
         }
+        if self.kind and self.kind != "scalar":
+            data["kind"] = self.kind
+        if self.parent:
+            data["parent"] = self.parent
+        if self.path:
+            data["path"] = self.path
+        if self.detail:
+            data["detail"] = self.detail
+        return data
 
 
 class MemoryWatchManager:
@@ -290,20 +313,33 @@ class MemoryWatchManager:
 
             changed = False
             for item in due_items:
+                started = time.monotonic()
+                value = ""
+                raw_hex = ""
+                latency_ms = 0.0
                 try:
                     raw = self._read_memory(item.address, value_type_size(item.value_type))
+                    raw_hex = _format_raw_bytes(raw)
                     value = format_watch_value(raw, item.value_type)
                     error = ""
                 except Exception as e:
-                    value = ""
                     error = str(e)
+                finally:
+                    latency_ms = (time.monotonic() - started) * 1000.0
 
                 with self._lock:
                     current = self._items.get(item.item_id)
                     if not current:
                         continue
-                    current.last_value = value
-                    current.last_error = error
+                    current.read_count += 1
+                    current.latency_ms = round(latency_ms, 3)
+                    if error:
+                        current.last_error = error
+                        current.fail_count += 1
+                    else:
+                        current.last_value = value
+                        current.last_raw = raw_hex
+                        current.last_error = ""
                     current.updated_at = time.time()
                     current.next_due = time.monotonic() + current.period_ms / 1000.0
                     changed = True
@@ -318,6 +354,10 @@ class MemoryWatchManager:
 
     def _snapshot_locked(self) -> List[Dict[str, Any]]:
         return [item.to_dict(include_runtime=True) for item in self._items.values()]
+
+
+def _format_raw_bytes(raw: bytes) -> str:
+    return " ".join(f"{byte:02X}" for byte in bytes(raw))
 
 
 def load_axf_symbols(path: str) -> List[Dict[str, Any]]:
@@ -477,15 +517,24 @@ def _load_dwarf_symbols(elf, symbols: Dict[str, AxfSymbol]) -> None:
             loc_attr = die.attributes.get("DW_AT_location")
             if not name_attr or not loc_attr:
                 continue
-            address = _location_to_address(loc_attr.value, address_size)
+            address = _location_attr_to_address(dwarf, die, loc_attr, address_size)
             if address is None:
                 continue
             if not _address_is_in_allocated_section(elf, address):
                 continue
             name = _decode_attr(name_attr.value)
-            value_type, size = _dwarf_type_to_watch(cu, die_by_offset, die)
-            if value_type:
-                symbols[name] = AxfSymbol(name=name, address=address, value_type=value_type, size=size)
+            type_die = _resolve_type_die(cu, die_by_offset, die)
+            if type_die is None:
+                continue
+            _add_dwarf_watch_symbols(
+                cu=cu,
+                die_by_offset=die_by_offset,
+                symbols=symbols,
+                name=name,
+                address=address,
+                type_die=type_die,
+                address_size=address_size,
+            )
 
 
 def _load_symtab_symbols(elf, symbols: Dict[str, AxfSymbol]) -> None:
@@ -502,6 +551,8 @@ def _load_symtab_symbols(elf, symbols: Dict[str, AxfSymbol]) -> None:
             if not name or address == 0:
                 continue
             if not _symbol_section_is_allocated(elf, sym):
+                continue
+            if _has_expanded_symbol(symbols, name):
                 continue
             if name not in symbols:
                 symbols[name] = AxfSymbol(
@@ -545,6 +596,39 @@ def _decode_attr(value) -> str:
     return str(value)
 
 
+def _attr_value(die, name: str, default: Any = None) -> Any:
+    attr = die.attributes.get(name)
+    if attr is None:
+        return default
+    return getattr(attr, "value", attr)
+
+
+def _attr_int(die, name: str, default: Optional[int] = None) -> Optional[int]:
+    value = _attr_value(die, name, default)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _die_name(die, default: str = "") -> str:
+    value = _attr_value(die, "DW_AT_name", default)
+    if value is None:
+        return default
+    return _decode_attr(value)
+
+
+def _has_expanded_symbol(symbols: Dict[str, AxfSymbol], name: str) -> bool:
+    prefix_dot = f"{name}."
+    prefix_bracket = f"{name}["
+    return any(
+        item_name.startswith(prefix_dot) or item_name.startswith(prefix_bracket)
+        for item_name in symbols
+    )
+
+
 def _location_to_address(expr, address_size: int) -> Optional[int]:
     if isinstance(expr, int):
         # DWARF location-list offset; first phase only supports direct DW_OP_addr.
@@ -558,11 +642,48 @@ def _location_to_address(expr, address_size: int) -> Optional[int]:
     return int.from_bytes(data[1 : 1 + size], byteorder="little", signed=False)
 
 
+def _location_attr_to_address(dwarf, die, loc_attr, address_size: int) -> Optional[int]:
+    address = _location_to_address(getattr(loc_attr, "value", loc_attr), address_size)
+    if address is not None:
+        return address
+
+    offset = getattr(loc_attr, "value", loc_attr)
+    if not isinstance(offset, int):
+        return None
+    try:
+        loc_lists = dwarf.location_lists()
+    except Exception:
+        return None
+    try:
+        entries = loc_lists.get_location_list_at_offset(offset, die=die)
+    except TypeError:
+        try:
+            entries = loc_lists.get_location_list_at_offset(offset)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+    for entry in entries or []:
+        expr = getattr(entry, "loc_expr", None)
+        if expr is None and isinstance(entry, dict):
+            expr = entry.get("loc_expr")
+        if expr is None:
+            continue
+        address = _location_to_address(expr, address_size)
+        if address is not None:
+            return address
+    return None
+
+
 def _dwarf_type_to_watch(cu, die_by_offset, die) -> Tuple[Optional[str], int]:
     type_die = _resolve_type_die(cu, die_by_offset, die)
     if type_die is None:
         return None, 0
-    return _type_die_to_watch(cu, die_by_offset, type_die)
+    info = _type_die_to_watch_info(cu, die_by_offset, type_die, 4)
+    if info and info.get("watch_type"):
+        return str(info["watch_type"]), int(info.get("size", 0))
+    return None, 0
 
 
 def _resolve_type_die(cu, die_by_offset, die):
@@ -576,7 +697,7 @@ def _resolve_type_die(cu, die_by_offset, die):
     return die_by_offset.get(offset)
 
 
-def _type_die_to_watch(cu, die_by_offset, die) -> Tuple[Optional[str], int]:
+def _unwrap_type_die(cu, die_by_offset, die):
     while die is not None and die.tag in (
         "DW_TAG_typedef",
         "DW_TAG_const_type",
@@ -587,28 +708,353 @@ def _type_die_to_watch(cu, die_by_offset, die) -> Tuple[Optional[str], int]:
         if next_die is None:
             break
         die = next_die
+    return die
+
+
+def _type_die_to_watch(cu, die_by_offset, die) -> Tuple[Optional[str], int]:
+    info = _type_die_to_watch_info(cu, die_by_offset, die, 4)
+    if info and info.get("watch_type"):
+        return str(info["watch_type"]), int(info.get("size", 0))
+    return None, 0
+
+
+def _type_die_to_watch_info(
+    cu,
+    die_by_offset,
+    die,
+    address_size: int,
+    seen: Optional[set] = None,
+) -> Optional[Dict[str, Any]]:
+    seen = set() if seen is None else set(seen)
+    die = _unwrap_type_die(cu, die_by_offset, die)
 
     if die is None:
-        return None, 0
+        return None
+    die_offset = getattr(die, "offset", None)
+    if die_offset is not None:
+        if die_offset in seen:
+            return None
+        seen.add(die_offset)
+
     if die.tag == "DW_TAG_base_type":
-        size_attr = die.attributes.get("DW_AT_byte_size")
-        encoding_attr = die.attributes.get("DW_AT_encoding")
-        if not size_attr or not encoding_attr:
-            return None, 0
-        size = int(size_attr.value)
-        encoding = int(encoding_attr.value)
+        size = _attr_int(die, "DW_AT_byte_size", 0) or 0
+        encoding = _attr_int(die, "DW_AT_encoding", 0) or 0
+        if size <= 0 or encoding <= 0:
+            return None
         # DW_ATE_address=1, boolean=2, float=4, signed=5, signed_char=6,
         # unsigned=7, unsigned_char=8.
         if encoding == 4:
             if size == 4:
-                return "float", size
+                return {"kind": "scalar", "watch_type": "float", "size": size}
             if size == 8:
-                return "double", size
+                return {"kind": "scalar", "watch_type": "double", "size": size}
         if encoding in (5, 6):
-            return _size_to_default_type(size, signed=True), size
+            return {
+                "kind": "scalar",
+                "watch_type": _size_to_default_type(size, signed=True),
+                "size": size,
+            }
         if encoding in (1, 2, 7, 8):
-            return _size_to_default_type(size, signed=False), size
-    return None, 0
+            return {
+                "kind": "scalar",
+                "watch_type": _size_to_default_type(size, signed=False),
+                "size": size,
+            }
+        return None
+
+    if die.tag == "DW_TAG_enumeration_type":
+        size = _attr_int(die, "DW_AT_byte_size", 4) or 4
+        values = _enum_values(die)
+        signed = any(value < 0 for value in values.values())
+        return {
+            "kind": "enum",
+            "watch_type": _size_to_default_type(size, signed=signed),
+            "size": size,
+            "enum": values,
+            "type_name": _die_name(die),
+        }
+
+    if die.tag == "DW_TAG_pointer_type":
+        size = _attr_int(die, "DW_AT_byte_size", address_size) or address_size
+        target_die = _resolve_type_die(cu, die_by_offset, die)
+        return {
+            "kind": "pointer",
+            "watch_type": _size_to_default_type(size, signed=False),
+            "size": size,
+            "target": _die_name(_unwrap_type_die(cu, die_by_offset, target_die), "")
+            if target_die is not None
+            else "",
+        }
+
+    if die.tag == "DW_TAG_array_type":
+        element_die = _resolve_type_die(cu, die_by_offset, die)
+        element = _type_die_to_watch_info(
+            cu, die_by_offset, element_die, address_size, seen
+        ) if element_die is not None else None
+        counts = _array_dimension_counts(die)
+        if not element or not counts:
+            return None
+        element_size = int(element.get("size", 0))
+        total_count = 1
+        for count in counts:
+            total_count *= count
+        if element_size <= 0 or total_count <= 0:
+            return None
+        return {
+            "kind": "array",
+            "size": element_size * total_count,
+            "element": element,
+            "element_size": element_size,
+            "counts": counts,
+        }
+
+    if die.tag in ("DW_TAG_structure_type", "DW_TAG_union_type", "DW_TAG_class_type"):
+        fields = []
+        for child in _iter_die_children(die):
+            if child.tag != "DW_TAG_member":
+                continue
+            if "DW_AT_bit_size" in child.attributes:
+                continue
+            field_name = _die_name(child)
+            if not field_name:
+                continue
+            field_offset = _member_offset(child)
+            if field_offset is None:
+                continue
+            field_die = _resolve_type_die(cu, die_by_offset, child)
+            field_info = _type_die_to_watch_info(
+                cu, die_by_offset, field_die, address_size, seen
+            ) if field_die is not None else None
+            if not field_info:
+                continue
+            fields.append(
+                {
+                    "name": field_name,
+                    "offset": field_offset,
+                    "type": field_info,
+                }
+            )
+        if not fields:
+            return None
+        return {
+            "kind": "union" if die.tag == "DW_TAG_union_type" else "struct",
+            "size": _attr_int(die, "DW_AT_byte_size", 0) or 0,
+            "type_name": _die_name(die),
+            "fields": fields,
+        }
+    return None
+
+
+def _add_dwarf_watch_symbols(
+    cu,
+    die_by_offset,
+    symbols: Dict[str, AxfSymbol],
+    name: str,
+    address: int,
+    type_die,
+    address_size: int,
+) -> int:
+    info = _type_die_to_watch_info(cu, die_by_offset, type_die, address_size)
+    if not info:
+        return 0
+    return _expand_watch_type_symbols(
+        symbols=symbols,
+        name=name,
+        address=address,
+        info=info,
+        parent=name,
+        path=name,
+        depth=0,
+    )
+
+
+def _expand_watch_type_symbols(
+    symbols: Dict[str, AxfSymbol],
+    name: str,
+    address: int,
+    info: Dict[str, Any],
+    parent: str,
+    path: str,
+    depth: int,
+) -> int:
+    if depth > MAX_DWARF_EXPANSION_DEPTH:
+        return 0
+
+    watch_type = info.get("watch_type")
+    if watch_type:
+        detail = _symbol_detail(info)
+        symbols[name] = AxfSymbol(
+            name=name,
+            address=address,
+            value_type=str(watch_type),
+            size=int(info.get("size", value_type_size(str(watch_type)))),
+            kind=str(info.get("kind") or "scalar"),
+            parent="" if name == parent else parent,
+            path=path,
+            detail=detail,
+        )
+        return 1
+
+    kind = info.get("kind")
+    if kind == "array":
+        return _expand_array_symbols(
+            symbols=symbols,
+            name=name,
+            address=address,
+            info=info,
+            parent=parent,
+            path=path,
+            depth=depth,
+        )
+    if kind in ("struct", "union"):
+        added = 0
+        for field in info.get("fields", []):
+            field_name = f"{name}.{field['name']}"
+            field_path = f"{path}.{field['name']}"
+            added += _expand_watch_type_symbols(
+                symbols=symbols,
+                name=field_name,
+                address=address + int(field.get("offset", 0)),
+                info=field["type"],
+                parent=parent,
+                path=field_path,
+                depth=depth + 1,
+            )
+        return added
+    return 0
+
+
+def _expand_array_symbols(
+    symbols: Dict[str, AxfSymbol],
+    name: str,
+    address: int,
+    info: Dict[str, Any],
+    parent: str,
+    path: str,
+    depth: int,
+) -> int:
+    counts = list(info.get("counts") or [])
+    element = info.get("element")
+    element_size = int(info.get("element_size", 0))
+    if not counts or not element or element_size <= 0:
+        return 0
+    total_count = 1
+    for count in counts:
+        total_count *= int(count)
+    if total_count <= 0 or total_count > MAX_DWARF_ARRAY_ELEMENTS:
+        return 0
+
+    added = 0
+    strides = _array_strides(counts, element_size)
+    for indices in _array_indices(counts):
+        offset = sum(index * stride for index, stride in zip(indices, strides))
+        suffix = "".join(f"[{index}]" for index in indices)
+        added += _expand_watch_type_symbols(
+            symbols=symbols,
+            name=f"{name}{suffix}",
+            address=address + offset,
+            info=element,
+            parent=parent,
+            path=f"{path}{suffix}",
+            depth=depth + 1,
+        )
+    return added
+
+
+def _array_strides(counts: List[int], element_size: int) -> List[int]:
+    strides = []
+    for index in range(len(counts)):
+        stride = element_size
+        for count in counts[index + 1 :]:
+            stride *= int(count)
+        strides.append(stride)
+    return strides
+
+
+def _array_indices(counts: List[int]) -> List[Tuple[int, ...]]:
+    result: List[Tuple[int, ...]] = [()]
+    for count in counts:
+        result = [prefix + (idx,) for prefix in result for idx in range(int(count))]
+    return result
+
+
+def _symbol_detail(info: Dict[str, Any]) -> Dict[str, Any]:
+    detail: Dict[str, Any] = {}
+    if info.get("enum"):
+        detail["enum"] = dict(info["enum"])
+    if info.get("target"):
+        detail["target"] = str(info["target"])
+    if info.get("type_name"):
+        detail["type_name"] = str(info["type_name"])
+    return detail
+
+
+def _iter_die_children(die) -> List[Any]:
+    try:
+        return list(die.iter_children())
+    except Exception:
+        return []
+
+
+def _enum_values(die) -> Dict[str, int]:
+    values: Dict[str, int] = {}
+    for child in _iter_die_children(die):
+        if child.tag != "DW_TAG_enumerator":
+            continue
+        name = _die_name(child)
+        value = _attr_int(child, "DW_AT_const_value", None)
+        if name and value is not None:
+            values[name] = value
+    return values
+
+
+def _array_dimension_counts(die) -> List[int]:
+    counts: List[int] = []
+    for child in _iter_die_children(die):
+        if child.tag != "DW_TAG_subrange_type":
+            continue
+        count = _attr_int(child, "DW_AT_count", None)
+        if count is None:
+            lower = _attr_int(child, "DW_AT_lower_bound", 0) or 0
+            upper = _attr_int(child, "DW_AT_upper_bound", None)
+            if upper is None:
+                continue
+            count = upper - lower + 1
+        if count is None or count <= 0:
+            continue
+        counts.append(int(count))
+    return counts
+
+
+def _member_offset(die) -> Optional[int]:
+    value = _attr_value(die, "DW_AT_data_member_location", 0)
+    if isinstance(value, int):
+        return value
+    try:
+        data = bytes(value)
+    except Exception:
+        return None
+    if not data:
+        return 0
+    if data[0] == 0x23:  # DW_OP_plus_uconst
+        return _decode_uleb128(data, 1)[0]
+    if data[0] == 0x10:  # DW_OP_constu
+        return _decode_uleb128(data, 1)[0]
+    return None
+
+
+def _decode_uleb128(data: bytes, offset: int = 0) -> Tuple[int, int]:
+    result = 0
+    shift = 0
+    index = offset
+    while index < len(data):
+        byte = data[index]
+        index += 1
+        result |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            break
+        shift += 7
+    return result, index
 
 
 def _size_to_default_type(size: int, signed: bool = False) -> str:

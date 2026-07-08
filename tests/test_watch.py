@@ -5,12 +5,35 @@ import struct
 
 from cnrtt.watch import (
     MemoryWatchManager,
+    _add_dwarf_watch_symbols,
     _load_elf_symtab_symbols_raw,
     _location_to_address,
+    _location_attr_to_address,
     format_watch_value,
     load_axf_symbols,
     value_type_size,
 )
+
+
+class _FakeAttr:
+    def __init__(self, value, form=""):
+        self.value = value
+        self.form = form
+
+
+class _FakeDie:
+    def __init__(self, tag, attrs=None, offset=0, children=None):
+        self.tag = tag
+        self.attributes = attrs or {}
+        self.offset = offset
+        self._children = children or []
+
+    def iter_children(self):
+        return iter(self._children)
+
+
+class _FakeCU:
+    cu_offset = 0
 
 
 def test_format_watch_value_integer_and_float():
@@ -27,6 +50,174 @@ def test_value_type_size():
 
 def test_location_list_offset_is_ignored():
     assert _location_to_address(0x20000000, 4) is None
+
+
+def test_location_attr_reads_direct_location_list_expr():
+    class Entry:
+        loc_expr = bytes([0x03, 0x78, 0x56, 0x34, 0x12])
+
+    class LocationLists:
+        def get_location_list_at_offset(self, offset, die=None):
+            assert offset == 0x40
+            assert die is not None
+            return [Entry()]
+
+    class Dwarf:
+        def location_lists(self):
+            return LocationLists()
+
+    assert (
+        _location_attr_to_address(
+            Dwarf(),
+            _FakeDie("DW_TAG_variable"),
+            _FakeAttr(0x40, form="DW_FORM_sec_offset"),
+            4,
+        )
+        == 0x12345678
+    )
+
+
+def test_dwarf_symbol_expands_struct_array_enum_and_pointer():
+    u32_die = _FakeDie(
+        "DW_TAG_base_type",
+        {
+            "DW_AT_byte_size": _FakeAttr(4),
+            "DW_AT_encoding": _FakeAttr(7),
+        },
+        offset=1,
+    )
+    u16_die = _FakeDie(
+        "DW_TAG_base_type",
+        {
+            "DW_AT_byte_size": _FakeAttr(2),
+            "DW_AT_encoding": _FakeAttr(7),
+        },
+        offset=2,
+    )
+    enum_die = _FakeDie(
+        "DW_TAG_enumeration_type",
+        {
+            "DW_AT_name": _FakeAttr(b"Mode"),
+            "DW_AT_byte_size": _FakeAttr(4),
+        },
+        offset=3,
+        children=[
+            _FakeDie(
+                "DW_TAG_enumerator",
+                {
+                    "DW_AT_name": _FakeAttr(b"IDLE"),
+                    "DW_AT_const_value": _FakeAttr(0),
+                },
+            ),
+            _FakeDie(
+                "DW_TAG_enumerator",
+                {
+                    "DW_AT_name": _FakeAttr(b"RUN"),
+                    "DW_AT_const_value": _FakeAttr(1),
+                },
+            ),
+        ],
+    )
+    array_die = _FakeDie(
+        "DW_TAG_array_type",
+        {"DW_AT_type": _FakeAttr(2)},
+        offset=4,
+        children=[
+            _FakeDie("DW_TAG_subrange_type", {"DW_AT_count": _FakeAttr(3)}),
+        ],
+    )
+    pointer_die = _FakeDie(
+        "DW_TAG_pointer_type",
+        {
+            "DW_AT_byte_size": _FakeAttr(4),
+            "DW_AT_type": _FakeAttr(6),
+        },
+        offset=5,
+    )
+    struct_die = _FakeDie(
+        "DW_TAG_structure_type",
+        {
+            "DW_AT_name": _FakeAttr(b"State"),
+            "DW_AT_byte_size": _FakeAttr(20),
+        },
+        offset=6,
+        children=[
+            _FakeDie(
+                "DW_TAG_member",
+                {
+                    "DW_AT_name": _FakeAttr(b"counter"),
+                    "DW_AT_type": _FakeAttr(1),
+                    "DW_AT_data_member_location": _FakeAttr(0),
+                },
+            ),
+            _FakeDie(
+                "DW_TAG_member",
+                {
+                    "DW_AT_name": _FakeAttr(b"samples"),
+                    "DW_AT_type": _FakeAttr(4),
+                    "DW_AT_data_member_location": _FakeAttr(4),
+                },
+            ),
+            _FakeDie(
+                "DW_TAG_member",
+                {
+                    "DW_AT_name": _FakeAttr(b"mode"),
+                    "DW_AT_type": _FakeAttr(3),
+                    "DW_AT_data_member_location": _FakeAttr(10),
+                },
+            ),
+            _FakeDie(
+                "DW_TAG_member",
+                {
+                    "DW_AT_name": _FakeAttr(b"next"),
+                    "DW_AT_type": _FakeAttr(5),
+                    "DW_AT_data_member_location": _FakeAttr(16),
+                },
+            ),
+        ],
+    )
+    die_by_offset = {
+        1: u32_die,
+        2: u16_die,
+        3: enum_die,
+        4: array_die,
+        5: pointer_die,
+        6: struct_die,
+    }
+    symbols = {}
+
+    added = _add_dwarf_watch_symbols(
+        cu=_FakeCU(),
+        die_by_offset=die_by_offset,
+        symbols=symbols,
+        name="state",
+        address=0x20000000,
+        type_die=struct_die,
+        address_size=4,
+    )
+
+    assert added == 6
+    assert symbols["state.counter"].to_dict() == {
+        "name": "state.counter",
+        "address": 0x20000000,
+        "address_hex": "0x20000000",
+        "type": "u32",
+        "size": 4,
+        "parent": "state",
+        "path": "state.counter",
+    }
+    assert symbols["state.samples[0]"].address == 0x20000004
+    assert symbols["state.samples[0]"].value_type == "u16"
+    assert symbols["state.samples[1]"].address == 0x20000006
+    assert symbols["state.samples[2]"].address == 0x20000008
+    assert symbols["state.mode"].to_dict()["detail"] == {
+        "enum": {"IDLE": 0, "RUN": 1},
+        "type_name": "Mode",
+    }
+    assert symbols["state.mode"].to_dict()["kind"] == "enum"
+    assert symbols["state.next"].address == 0x20000010
+    assert symbols["state.next"].value_type == "u32"
+    assert symbols["state.next"].to_dict()["detail"] == {"target": "State"}
 
 
 def test_memory_watch_manager_polls_due_items():
@@ -51,6 +242,41 @@ def test_memory_watch_manager_polls_due_items():
 
     assert item["name"] == "counter"
     assert updates[-1][0]["value"] == "1 (0x00000001)"
+    assert updates[-1][0]["raw"] == "01 00 00 00"
+    assert updates[-1][0]["read_count"] >= 1
+    assert updates[-1][0]["fail_count"] == 0
+    assert updates[-1][0]["latency_ms"] >= 0
+
+
+def test_memory_watch_manager_records_failures_without_losing_last_value():
+    updates = []
+    calls = 0
+
+    def read_memory(address, size):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return bytes([2, 0, 0, 0])
+        raise RuntimeError("bus fault")
+
+    mgr = MemoryWatchManager(read_memory=read_memory, on_update=updates.append)
+    mgr.add_item("counter", 0x20000000, "u32", period_ms=50)
+    try:
+        mgr.start()
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if updates and updates[-1][0].get("fail_count", 0) >= 1:
+                break
+            time.sleep(0.02)
+    finally:
+        mgr.stop()
+
+    latest = updates[-1][0]
+    assert latest["value"] == "2 (0x00000002)"
+    assert latest["raw"] == "02 00 00 00"
+    assert latest["error"] == "bus fault"
+    assert latest["read_count"] >= 2
+    assert latest["fail_count"] >= 1
 
 
 def test_load_axf_symbols_from_minimal_elf_symtab(tmp_path):

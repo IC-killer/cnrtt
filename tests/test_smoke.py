@@ -69,6 +69,11 @@ def test_gui_components():
         assert hasattr(app, "watch_run_btn")
         assert hasattr(app, "watch_tree")
         assert app.watch_run_btn.cget("text") == "开始采样"
+        assert hasattr(app, "watch_symbol_search_entry")
+        assert hasattr(app, "watch_symbol_search_btn")
+        assert hasattr(app, "watch_return_btn")
+        assert hasattr(app, "watch_search_tree")
+        assert app.watch_return_btn.cget("state") == tk.DISABLED
 
         app._refresh_watch_table(
             [
@@ -121,6 +126,78 @@ def test_gui_components():
         assert hasattr(app, "agent_toggle")
         assert app.agent_port_var.get() == "7000"
         assert "未监听" in app.agent_status_var.get()
+    finally:
+        root.destroy()
+
+
+def test_axf_symbol_search_result_view_adds_selected_symbols():
+    """GUI 应能搜索 AXF 展开符号，在结果表中选中后加入采样表。"""
+    root = tk.Tk()
+    try:
+        with mock.patch.object(RTTViewerApp, 'load_history', return_value={"last_device": "STM32F407VE", "devices": ["STM32F407VE"]}):
+            with mock.patch.object(RTTCore, "load_agent_config", return_value={}):
+                app = RTTViewerApp(root)
+
+        app.watch_symbols = [
+            {
+                "name": "state.counter",
+                "address": 0x20000000,
+                "address_hex": "0x20000000",
+                "type": "u32",
+                "parent": "state",
+                "path": "state.counter",
+            },
+            {
+                "name": "state.samples[0]",
+                "address": 0x20000004,
+                "address_hex": "0x20000004",
+                "type": "u16",
+                "parent": "state",
+                "path": "state.samples[0]",
+            },
+            {
+                "name": "mode",
+                "address": 0x20000010,
+                "address_hex": "0x20000010",
+                "type": "u32",
+                "kind": "enum",
+                "detail": {"enum": {"IDLE": 0, "RUN": 1}},
+            },
+        ]
+        app.watch_symbol_by_name = {item["name"]: item for item in app.watch_symbols}
+
+        app._refresh_watch_symbol_choices()
+        assert "变量 3 个" in app.watch_symbol_count_var.get()
+        assert "state.counter" in app.watch_name_combo.cget("values")
+
+        app.watch_symbol_search_var.set("state")
+        app.search_watch_symbols()
+        result_names = [
+            app.watch_search_tree.item(item_id, "values")[0]
+            for item_id in app.watch_search_tree.get_children()
+        ]
+        assert result_names == ["state.counter", "state.samples[0]"]
+        assert app.watch_return_btn.cget("state") == tk.NORMAL
+        assert app.watch_search_mode is True
+
+        app.watch_name_var.set("state.counter")
+        app._on_watch_symbol_selected()
+        assert app.watch_addr_var.get() == "0x20000000"
+        assert app.watch_type_var.get() == "u32"
+        assert "字段" in app.watch_status_var.get()
+
+        app.watch_search_tree.selection_set("sym0")
+        with mock.patch.object(app, "save_history"):
+            assert app.add_selected_search_symbols() == 1
+        names = {
+            item["name"]
+            for item in app.core.list_watch_items(include_runtime=False)
+        }
+        assert "state.counter" in names
+
+        app.show_watch_table()
+        assert app.watch_return_btn.cget("state") == tk.DISABLED
+        assert app.watch_search_mode is False
     finally:
         root.destroy()
 

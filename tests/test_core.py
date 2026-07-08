@@ -261,6 +261,7 @@ def test_health_check_recovers_disconnected_jlink(tmp_config_dir, fake_jlink):
         pl.enums.JLinkInterfaces.SWD = "SWD"
         pl.enums.JLinkInterfaces.JTAG = "JTAG"
         core.connect(device="STM32F407VE")
+    core.start_memory_watch()
 
     fake_jlink.connected.return_value = False
     try:
@@ -271,6 +272,7 @@ def test_health_check_recovers_disconnected_jlink(tmp_config_dir, fake_jlink):
             assert core.check_jlink_status(recover=True) is True
 
         assert core.is_connected is True
+        assert core.memory_watch_running() is True
         fake_jlink.close.assert_called()
         new_jlink.open.assert_called_once()
         new_jlink.connect.assert_called_with("STM32F407VE")
@@ -289,6 +291,59 @@ def test_memory_read_uses_active_jlink(core, fake_jlink):
     data = core.read_memory(0x20000000, 4)
     assert data == bytes([0x78, 0x56, 0x34, 0x12])
     fake_jlink.memory_read8.assert_called_with(0x20000000, 4)
+    cfg = core.get_config()
+    assert cfg["memory_read_count"] == 1
+    assert cfg["memory_read_fail_count"] == 0
+    assert cfg["last_memory_read_latency_ms"] >= 0
+
+
+def test_memory_read_validates_arguments_before_jlink_io(core, fake_jlink):
+    _patched_connect(core, fake_jlink)
+
+    invalid_cases = [
+        ("bad", 4),
+        (-1, 4),
+        (0x20000000, 0),
+        (0x20000000, core.get_config()["memory_read_limit"] + 1),
+    ]
+    for address, size in invalid_cases:
+        with pytest.raises(RTTError) as err:
+            core.read_memory(address, size)
+        assert err.value.kind == "invalid_params"
+
+    fake_jlink.memory_read8.assert_not_called()
+
+
+def test_memory_read_classifies_access_errors(core, fake_jlink):
+    _patched_connect(core, fake_jlink)
+    fake_jlink.memory_read8.side_effect = RuntimeError("bus fault")
+    try:
+        with pytest.raises(RTTError) as err:
+            core.read_memory(0xFFFFFFFF, 4)
+        assert err.value.kind == "access_error"
+        cfg = core.get_config()
+        assert cfg["memory_read_fail_count"] == 1
+        assert cfg["last_memory_read_error_kind"] == "access_error"
+        assert "bus fault" in cfg["last_memory_read_error"]
+    finally:
+        core.disconnect()
+
+
+def test_memory_read_connection_loss_marks_status_and_schedules_recovery(core, fake_jlink):
+    _patched_connect(core, fake_jlink)
+    fake_jlink.memory_read8.side_effect = RuntimeError("target not connected")
+    try:
+        with mock.patch.object(core, "_schedule_recovery") as schedule_recovery:
+            with pytest.raises(RTTError) as err:
+                core.read_memory(0x20000000, 4)
+        assert err.value.kind == "connection_lost"
+        schedule_recovery.assert_called_once()
+        assert core.is_connected is False
+        cfg = core.get_config()
+        assert cfg["jlink_status"] == "异常"
+        assert cfg["last_memory_read_error_kind"] == "connection_lost"
+    finally:
+        core.disconnect()
 
 
 def test_memory_watch_emits_updates(core, fake_jlink):
@@ -311,6 +366,9 @@ def test_memory_watch_emits_updates(core, fake_jlink):
     watch_events = [p for t, p in events if t == EVENT_WATCH]
     assert watch_events
     assert watch_events[-1]["items"][0]["value"] == "305419896 (0x12345678)"
+    assert watch_events[-1]["items"][0]["raw"] == "78 56 34 12"
+    assert watch_events[-1]["items"][0]["read_count"] >= 1
+    assert watch_events[-1]["items"][0]["fail_count"] == 0
 
 
 def test_disconnect(core, fake_jlink):

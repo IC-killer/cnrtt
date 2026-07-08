@@ -47,10 +47,17 @@ DEFAULT_HEALTH_OK_LOG_INTERVAL = 60.0
 OUTPUT_BUFFER_SIZE = 64 * 1024
 # agent 命令历史上限
 AGENT_HISTORY_LIMIT = 1000
+# 单次运行态内存读取上限，避免误操作造成长时间占用 J-Link IO 锁。
+DEFAULT_MEMORY_READ_LIMIT = 64 * 1024
+MEMORY_READ_ADDRESS_LIMIT = (1 << 64) - 1
 
 
 class RTTError(Exception):
     """RTT 业务错误，携带可读消息；agent_server 会映射为 JSON-RPC 错误码。"""
+
+    def __init__(self, message: str, kind: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.kind = kind or "internal"
 
 
 # ── 事件类型 ──────────────────────────────────────────────────
@@ -77,6 +84,7 @@ class RTTCore:
         send_retries: int = 20,
         health_check_interval: float = DEFAULT_HEALTH_CHECK_INTERVAL,
         health_reconnect_attempts: int = DEFAULT_HEALTH_RECONNECT_ATTEMPTS,
+        memory_read_limit: int = DEFAULT_MEMORY_READ_LIMIT,
     ) -> None:
         self._lock = threading.RLock()
         self._jlink_io_lock = threading.RLock()
@@ -124,6 +132,13 @@ class RTTCore:
         self._health_reconnect_attempts = max(0, int(health_reconnect_attempts))
         self._health_reconnect_delay = DEFAULT_HEALTH_RECONNECT_DELAY
         self._health_ok_log_interval = DEFAULT_HEALTH_OK_LOG_INTERVAL
+        self._memory_read_limit = max(1, int(memory_read_limit or DEFAULT_MEMORY_READ_LIMIT))
+        self._memory_read_count = 0
+        self._memory_read_fail_count = 0
+        self._last_memory_read_at = 0.0
+        self._last_memory_read_latency_ms = 0.0
+        self._last_memory_read_error = ""
+        self._last_memory_read_error_kind = ""
 
         # agent 命令历史（由 agent_server 维护，core 提供存取）
         self._agent_history: List[str] = []
@@ -604,16 +619,116 @@ class RTTCore:
     # ── 运行态内存读取 / 变量监控 ─────────────────────────────
     def read_memory(self, address: int, size: int) -> bytes:
         """Read target memory without halting through the active J-Link session."""
-        if size <= 0:
-            raise RTTError("memory read size must be positive")
-        with self._jlink_io_lock:
-            if not self._connected or not self._jlink:
-                raise RTTError("not connected")
-            try:
-                data = self._jlink.memory_read8(int(address), int(size))
-            except Exception as e:
-                raise RTTError(f"memory read error: {e}") from e
-        return bytes(data)
+        address, size = self._normalize_memory_read_args(address, size)
+        started = time.monotonic()
+        try:
+            with self._jlink_io_lock:
+                if not self._connected or not self._jlink:
+                    raise RTTError("not connected", kind="not_connected")
+                data = self._jlink.memory_read8(address, size)
+            result = bytes(data)
+            if len(result) != size:
+                raise RTTError(
+                    f"memory read short: {len(result)}/{size}",
+                    kind="short_read",
+                )
+            self._record_memory_read_result(
+                ok=True,
+                latency_ms=(time.monotonic() - started) * 1000.0,
+            )
+            return result
+        except RTTError as e:
+            self._record_memory_read_result(
+                ok=False,
+                latency_ms=(time.monotonic() - started) * 1000.0,
+                error=str(e),
+                error_kind=e.kind,
+            )
+            raise
+        except Exception as e:
+            kind = self._classify_memory_read_error(e)
+            message = f"memory read error [{kind}]: {e}"
+            self._record_memory_read_result(
+                ok=False,
+                latency_ms=(time.monotonic() - started) * 1000.0,
+                error=message,
+                error_kind=kind,
+            )
+            if kind == "connection_lost":
+                with self._lock:
+                    self._connected = False
+                    self._set_jlink_status("异常", message)
+                self.stop_memory_watch()
+                self._emit_status()
+                self._schedule_recovery(f"内存读取失败: {e}")
+            raise RTTError(message, kind=kind) from e
+
+    def _normalize_memory_read_args(self, address: Any, size: Any) -> Tuple[int, int]:
+        try:
+            addr = int(str(address).strip(), 0) if not isinstance(address, int) else address
+        except (TypeError, ValueError) as e:
+            raise RTTError(f"memory read address invalid: {address}", kind="invalid_params") from e
+        try:
+            read_size = int(str(size).strip(), 0) if not isinstance(size, int) else size
+        except (TypeError, ValueError) as e:
+            raise RTTError(f"memory read size invalid: {size}", kind="invalid_params") from e
+
+        if addr < 0:
+            raise RTTError("memory read address must be non-negative", kind="invalid_params")
+        if read_size <= 0:
+            raise RTTError("memory read size must be positive", kind="invalid_params")
+        if read_size > self._memory_read_limit:
+            raise RTTError(
+                f"memory read size exceeds limit: {read_size}/{self._memory_read_limit}",
+                kind="invalid_params",
+            )
+        if addr > MEMORY_READ_ADDRESS_LIMIT or addr + read_size - 1 > MEMORY_READ_ADDRESS_LIMIT:
+            raise RTTError("memory read address range overflow", kind="invalid_params")
+        return addr, read_size
+
+    @staticmethod
+    def _classify_memory_read_error(exc: Exception) -> str:
+        text = str(exc).lower()
+        disconnected_markers = (
+            "not connected",
+            "disconnected",
+            "connection",
+            "no emulator",
+            "no probe",
+            "target not connected",
+        )
+        access_markers = (
+            "bus fault",
+            "fault",
+            "access",
+            "permission",
+            "out of range",
+            "invalid address",
+        )
+        if any(marker in text for marker in disconnected_markers):
+            return "connection_lost"
+        if any(marker in text for marker in access_markers):
+            return "access_error"
+        return "jlink_error"
+
+    def _record_memory_read_result(
+        self,
+        ok: bool,
+        latency_ms: float,
+        error: str = "",
+        error_kind: str = "",
+    ) -> None:
+        with self._lock:
+            self._memory_read_count += 1
+            self._last_memory_read_at = time.time()
+            self._last_memory_read_latency_ms = round(float(latency_ms), 3)
+            if ok:
+                self._last_memory_read_error = ""
+                self._last_memory_read_error_kind = ""
+            else:
+                self._memory_read_fail_count += 1
+                self._last_memory_read_error = str(error)
+                self._last_memory_read_error_kind = str(error_kind or "internal")
 
     def add_watch_item(
         self,
@@ -691,6 +806,13 @@ class RTTCore:
                 "last_health_check": self._last_health_check,
                 "health_check_interval": self._health_check_interval,
                 "health_reconnect_attempts": self._health_reconnect_attempts,
+                "memory_read_limit": self._memory_read_limit,
+                "memory_read_count": self._memory_read_count,
+                "memory_read_fail_count": self._memory_read_fail_count,
+                "last_memory_read_at": self._last_memory_read_at,
+                "last_memory_read_latency_ms": self._last_memory_read_latency_ms,
+                "last_memory_read_error": self._last_memory_read_error,
+                "last_memory_read_error_kind": self._last_memory_read_error_kind,
             }
 
     def set_config(self, **kwargs: Any) -> Dict[str, Any]:

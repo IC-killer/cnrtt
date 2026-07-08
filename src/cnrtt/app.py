@@ -11,7 +11,7 @@ import re
 import tkinter as tk
 from datetime import datetime
 from tkinter import filedialog, scrolledtext, ttk
-from typing import Optional
+from typing import Any, Dict, List, Optional
 
 from cnrtt.core import (
     EVENT_CONFIG,
@@ -37,6 +37,7 @@ ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;]*m')
 
 APP_USER_MODEL_ID = "cnrtt.rttviewer"
 APP_DISPLAY_NAME = "cnrtt RTT Viewer"
+MAX_GUI_BULK_ADD_SYMBOLS = 200
 
 
 def _hide_console_window():
@@ -539,13 +540,52 @@ class RTTViewerApp:
         self.watch_clear_btn = tk.Button(editor, text="清空", command=self.clear_watch_items)
         self.watch_clear_btn.pack(side=tk.LEFT)
 
+        symbol_tools = tk.Frame(self.watch_panel)
+        symbol_tools.pack(fill=tk.X, pady=(0, 4))
+
+        tk.Label(symbol_tools, text="AXF搜索:").pack(side=tk.LEFT)
+        self.watch_symbol_search_var = tk.StringVar()
+        self.watch_symbol_search_entry = tk.Entry(
+            symbol_tools,
+            textvariable=self.watch_symbol_search_var,
+            width=24,
+        )
+        self.watch_symbol_search_entry.pack(side=tk.LEFT, padx=(4, 8))
+        self.watch_symbol_search_entry.bind("<Return>", self.search_watch_symbols)
+
+        self.watch_symbol_search_btn = tk.Button(
+            symbol_tools,
+            text="搜索",
+            command=self.search_watch_symbols,
+        )
+        self.watch_symbol_search_btn.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.watch_return_btn = tk.Button(
+            symbol_tools,
+            text="返回监控列表",
+            command=self.show_watch_table,
+            state=tk.DISABLED,
+        )
+        self.watch_return_btn.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.watch_symbol_count_var = tk.StringVar(value="未加载 AXF")
+        self.watch_symbol_count_label = tk.Label(
+            symbol_tools,
+            textvariable=self.watch_symbol_count_var,
+            anchor="w",
+        )
+        self.watch_symbol_count_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
         table_frame = tk.Frame(self.watch_panel)
         table_frame.pack(fill=tk.X)
+
+        self.watch_table_frame = tk.Frame(table_frame)
+        self.watch_table_frame.pack(fill=tk.X)
 
         columns = ("enabled", "name", "address", "type", "period", "value", "status")
         self.watch_tree_columns = columns
         self.watch_tree = ttk.Treeview(
-            table_frame,
+            self.watch_table_frame,
             columns=columns,
             show="headings",
             height=5,
@@ -579,12 +619,51 @@ class RTTViewerApp:
         self.watch_tree.bind("<Control-C>", self.copy_watch_selection)
 
         scrollbar = ttk.Scrollbar(
-            table_frame,
+            self.watch_table_frame,
             orient=tk.VERTICAL,
             command=self.watch_tree.yview,
         )
         scrollbar.pack(side=tk.LEFT, fill=tk.Y)
         self.watch_tree.configure(yscrollcommand=scrollbar.set)
+        self.watch_tree_scrollbar = scrollbar
+
+        self.watch_search_frame = tk.Frame(table_frame)
+        search_columns = ("name", "address", "type", "kind", "detail")
+        self.watch_search_columns = search_columns
+        self.watch_search_tree = ttk.Treeview(
+            self.watch_search_frame,
+            columns=search_columns,
+            show="headings",
+            height=5,
+            selectmode="extended",
+        )
+        search_headings = {
+            "name": "名称",
+            "address": "地址",
+            "type": "类型",
+            "kind": "类别",
+            "detail": "说明",
+        }
+        search_widths = {
+            "name": 230,
+            "address": 100,
+            "type": 60,
+            "kind": 70,
+            "detail": 260,
+        }
+        for col in search_columns:
+            self.watch_search_tree.heading(col, text=search_headings[col])
+            self.watch_search_tree.column(col, width=search_widths[col], anchor=tk.W)
+        self.watch_search_tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.watch_search_tree.bind("<Double-1>", self.add_selected_search_symbols)
+        self.watch_search_tree.bind("<Return>", self.add_selected_search_symbols)
+        self.watch_search_scrollbar = ttk.Scrollbar(
+            self.watch_search_frame,
+            orient=tk.VERTICAL,
+            command=self.watch_search_tree.yview,
+        )
+        self.watch_search_scrollbar.pack(side=tk.LEFT, fill=tk.Y)
+        self.watch_search_tree.configure(yscrollcommand=self.watch_search_scrollbar.set)
 
         self.watch_status_var = tk.StringVar(value="未加载 AXF")
         self.watch_status_label = tk.Label(self.watch_panel, textvariable=self.watch_status_var, anchor="w")
@@ -593,6 +672,15 @@ class RTTViewerApp:
         self.watch_popup_menu = tk.Menu(self.watch_tree, tearoff=0)
         self.watch_popup_menu.add_command(label="复制", command=self.copy_watch_selection)
         self.watch_tree.bind("<Button-3>", self.show_watch_popup)
+
+        self.watch_search_popup_menu = tk.Menu(self.watch_search_tree, tearoff=0)
+        self.watch_search_popup_menu.add_command(
+            label="添加到监控列表",
+            command=self.add_selected_search_symbols,
+        )
+        self.watch_search_tree.bind("<Button-3>", self.show_watch_search_popup)
+        self.watch_search_results: List[Dict[str, Any]] = []
+        self.watch_search_mode = False
 
     def _restore_watch_items(self):
         items = self.history.get("watch_items", [])
@@ -646,17 +734,150 @@ class RTTViewerApp:
         self.watch_axf_path = path
         self.watch_symbols = symbols
         self.watch_symbol_by_name = {item["name"]: item for item in symbols}
-        names = [item["name"] for item in symbols]
-        self.watch_name_combo.config(values=names)
+        self._refresh_watch_symbol_choices()
+        self.show_watch_table()
         synced = self._sync_axf_watch_items()
         sync_text = f"，同步 {synced} 个采样项" if synced else ""
-        self.watch_status_var.set(f"AXF: {path}，变量 {len(symbols)} 个{sync_text}")
+        summary = self._watch_symbol_summary(symbols)
+        self.watch_status_var.set(f"AXF: {path}，{summary}{sync_text}")
         self._set_watch_panel_visible(True)
         self.save_history()
         self.append_output(
-            f"[变量] 已加载 AXF: {path}，变量 {len(symbols)} 个{sync_text}。\n"
+            f"[变量] 已加载 AXF: {path}，{summary}{sync_text}。\n"
         )
         return symbols
+
+    def _watch_symbol_summary(self, symbols: List[Dict[str, Any]]) -> str:
+        expanded = sum(1 for item in symbols if item.get("parent"))
+        arrays = sum(1 for item in symbols if "[" in str(item.get("name", "")))
+        enums = sum(1 for item in symbols if item.get("kind") == "enum")
+        pointers = sum(1 for item in symbols if item.get("kind") == "pointer")
+        parts = [f"变量 {len(symbols)} 个"]
+        if expanded:
+            parts.append(f"展开 {expanded} 个")
+        if arrays:
+            parts.append(f"数组元素 {arrays} 个")
+        if enums:
+            parts.append(f"枚举 {enums} 个")
+        if pointers:
+            parts.append(f"指针 {pointers} 个")
+        return "，".join(parts)
+
+    def _watch_symbol_display_kind(self, symbol: Dict[str, Any]) -> str:
+        kind = str(symbol.get("kind") or "")
+        name = str(symbol.get("name") or "")
+        if kind == "enum":
+            return "枚举"
+        if kind == "pointer":
+            return "指针"
+        if "[" in name:
+            return "数组"
+        if symbol.get("parent"):
+            return "字段"
+        return "标量"
+
+    def _symbol_search_haystack(self, symbol: Dict[str, Any]) -> str:
+        return " ".join(
+            str(value)
+            for value in (
+                symbol.get("name", ""),
+                symbol.get("address_hex", ""),
+                symbol.get("type", ""),
+                symbol.get("parent", ""),
+                symbol.get("path", ""),
+                symbol.get("kind", ""),
+                symbol.get("detail", ""),
+                self._watch_symbol_display_kind(symbol),
+            )
+        ).lower()
+
+    def _search_watch_symbols(self, query: str) -> List[Dict[str, Any]]:
+        terms = [term for term in query.strip().lower().split() if term]
+        if not terms:
+            return []
+        return [
+            symbol
+            for symbol in self.watch_symbols
+            if all(term in self._symbol_search_haystack(symbol) for term in terms)
+        ]
+
+    def _refresh_watch_symbol_choices(self):
+        names = [item["name"] for item in self.watch_symbols]
+        self.watch_name_combo.config(values=names)
+        if self.watch_symbols:
+            self.watch_symbol_count_var.set(
+                self._watch_symbol_summary(self.watch_symbols)
+            )
+        else:
+            self.watch_symbol_count_var.set("未加载 AXF")
+
+    def _search_result_detail(self, symbol: Dict[str, Any]) -> str:
+        detail = symbol.get("detail") or {}
+        if isinstance(detail, dict):
+            if detail.get("enum"):
+                values = detail.get("enum") or {}
+                return "enum " + ", ".join(
+                    f"{name}={value}" for name, value in list(values.items())[:4]
+                )
+            if detail.get("target"):
+                return f"-> {detail.get('target')}"
+            if detail.get("type_name"):
+                return str(detail.get("type_name"))
+        parent = symbol.get("parent")
+        if parent:
+            return f"parent: {parent}"
+        return str(symbol.get("path") or "")
+
+    def _populate_watch_search_results(self, symbols: List[Dict[str, Any]]):
+        self.watch_search_results = list(symbols)
+        for item_id in self.watch_search_tree.get_children():
+            self.watch_search_tree.delete(item_id)
+        for index, symbol in enumerate(self.watch_search_results):
+            item_id = f"sym{index}"
+            self.watch_search_tree.insert(
+                "",
+                tk.END,
+                iid=item_id,
+                values=(
+                    symbol.get("name", ""),
+                    symbol.get("address_hex", ""),
+                    symbol.get("type", ""),
+                    self._watch_symbol_display_kind(symbol),
+                    self._search_result_detail(symbol),
+                ),
+            )
+
+    def search_watch_symbols(self, event=None):
+        if not self.watch_symbols:
+            self.watch_status_var.set("请先加载 AXF")
+            return "break" if event is not None else None
+        query = self.watch_symbol_search_var.get().strip()
+        if not query:
+            self.watch_status_var.set("请输入 AXF 搜索关键词")
+            self.watch_symbol_search_entry.focus_set()
+            return "break" if event is not None else None
+        results = self._search_watch_symbols(query)
+        self._populate_watch_search_results(results)
+        self.show_watch_search_results()
+        self.watch_status_var.set(f"搜索 '{query}'，结果 {len(results)} 个")
+        return "break" if event is not None else None
+
+    def show_watch_search_results(self):
+        if self.watch_table_frame.winfo_ismapped():
+            self.watch_table_frame.pack_forget()
+        if not self.watch_search_frame.winfo_ismapped():
+            self.watch_search_frame.pack(fill=tk.X)
+        self.watch_return_btn.config(state=tk.NORMAL)
+        self.watch_search_mode = True
+
+    def show_watch_table(self):
+        if self.watch_search_frame.winfo_ismapped():
+            self.watch_search_frame.pack_forget()
+        if not self.watch_table_frame.winfo_ismapped():
+            self.watch_table_frame.pack(fill=tk.X)
+        self.watch_return_btn.config(state=tk.DISABLED)
+        self.watch_search_mode = False
+        self.watch_status_var.set("已返回监控列表")
 
     def _sync_axf_watch_items(self) -> int:
         items = self.core.list_watch_items(include_runtime=False)
@@ -686,6 +907,10 @@ class RTTViewerApp:
             return
         self.watch_addr_var.set(symbol.get("address_hex", f"0x{int(symbol['address']):08X}"))
         self.watch_type_var.set(symbol.get("type", "u32"))
+        self.watch_status_var.set(
+            f"已选择: {symbol.get('name', '')} @ {symbol.get('address_hex', '')} "
+            f"{symbol.get('type', '')} {self._watch_symbol_display_kind(symbol)}"
+        )
 
     def _parse_watch_period(self) -> int:
         try:
@@ -724,6 +949,74 @@ class RTTViewerApp:
         self.save_history()
         return item
 
+    def _add_watch_symbols(self, symbols: List[Dict[str, Any]]) -> int:
+        if not symbols:
+            self.watch_status_var.set("没有可添加的 AXF 符号")
+            return 0
+        if len(symbols) > MAX_GUI_BULK_ADD_SYMBOLS:
+            self.watch_status_var.set(
+                f"待添加 {len(symbols)} 个，超过上限 {MAX_GUI_BULK_ADD_SYMBOLS}，请缩小搜索结果"
+            )
+            return 0
+
+        existing_names = {
+            item.get("name")
+            for item in self.core.list_watch_items(include_runtime=False)
+        }
+        period_ms = self._parse_watch_period()
+        added = 0
+        skipped = 0
+        for symbol in symbols:
+            name = str(symbol.get("name", "") or "")
+            if not name or name in existing_names:
+                skipped += 1
+                continue
+            try:
+                self.core.add_watch_item(
+                    name=name,
+                    address=int(symbol.get("address", 0)),
+                    value_type=str(symbol.get("type", "u32")),
+                    period_ms=period_ms,
+                    enabled=self.watch_enabled_var.get(),
+                    source="axf",
+                )
+            except RTTError as e:
+                self.watch_status_var.set(f"添加 {name} 失败: {e}")
+                break
+            existing_names.add(name)
+            added += 1
+        self._refresh_watch_table(self.core.list_watch_items())
+        self.save_history()
+        skipped_text = f"，跳过 {skipped} 个" if skipped else ""
+        self.watch_status_var.set(f"已添加 {added} 个 AXF 符号{skipped_text}")
+        return added
+
+    def _selected_search_symbols(self) -> List[Dict[str, Any]]:
+        selected = list(self.watch_search_tree.selection())
+        if not selected:
+            focused = self.watch_search_tree.focus()
+            if focused:
+                selected = [focused]
+        symbols = []
+        for item_id in selected:
+            if not item_id.startswith("sym"):
+                continue
+            try:
+                index = int(item_id[3:])
+            except ValueError:
+                continue
+            if 0 <= index < len(self.watch_search_results):
+                symbols.append(self.watch_search_results[index])
+        return symbols
+
+    def add_selected_search_symbols(self, event=None):
+        try:
+            added = self._add_watch_symbols(self._selected_search_symbols())
+        except RTTError as e:
+            self.watch_status_var.set(str(e))
+            added = 0
+        return "break" if event is not None else added
+
     def remove_selected_watch_item(self):
         selected = self.watch_tree.selection()
         if not selected:
@@ -760,6 +1053,19 @@ class RTTViewerApp:
             return "break"
         self.core.set_watch_item_enabled(item_id, not bool(item.get("enabled", True)))
         self.save_history()
+        return "break"
+
+    def show_watch_search_popup(self, event):
+        row_id = self.watch_search_tree.identify_row(event.y)
+        if not row_id:
+            return "break"
+        if row_id not in self.watch_search_tree.selection():
+            self.watch_search_tree.selection_set(row_id)
+        self.watch_search_tree.focus(row_id)
+        try:
+            self.watch_search_popup_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.watch_search_popup_menu.grab_release()
         return "break"
 
     def show_watch_popup(self, event):
@@ -821,7 +1127,21 @@ class RTTViewerApp:
         for item_id in existing - incoming:
             self.watch_tree.delete(item_id)
         for item_id, item in self._watch_rows.items():
-            status = item.get("error") or ("OK" if item.get("value") else "")
+            read_count = int(item.get("read_count") or 0)
+            fail_count = int(item.get("fail_count") or 0)
+            latency_ms = item.get("latency_ms")
+            if item.get("error"):
+                status = item.get("error", "")
+                if read_count:
+                    status = f"{status} ({fail_count}/{read_count})"
+            elif item.get("value"):
+                status = "OK"
+                if read_count:
+                    status = f"{status} {read_count}次"
+                if latency_ms not in (None, ""):
+                    status = f"{status} {latency_ms}ms"
+            else:
+                status = ""
             values = (
                 "是" if item.get("enabled") else "否",
                 item.get("name", ""),
