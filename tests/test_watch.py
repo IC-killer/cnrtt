@@ -279,6 +279,79 @@ def test_memory_watch_manager_records_failures_without_losing_last_value():
     assert latest["fail_count"] >= 1
 
 
+def _due_items(manager):
+    with manager._lock:
+        return list(manager._items.values())
+
+
+def test_memory_watch_manager_coalesces_adjacent_reads():
+    calls = []
+    base = 0x20000000
+    memory = bytes(range(16))
+
+    def read_memory(address, size):
+        calls.append((address, size))
+        offset = address - base
+        return memory[offset : offset + size]
+
+    mgr = MemoryWatchManager(
+        read_memory=read_memory,
+        on_update=lambda items: None,
+        merge_gap=0,
+    )
+    mgr.add_item("counter", base, "u32", period_ms=50)
+    mgr.add_item("sample", base + 4, "u16", period_ms=50)
+
+    assert mgr._sample_due_items(_due_items(mgr)) is True
+
+    assert calls == [(base, 6)]
+    items = {item["name"]: item for item in mgr.list_items()}
+    assert items["counter"]["raw"] == "00 01 02 03"
+    assert items["sample"]["raw"] == "04 05"
+    stats = mgr.get_stats()
+    assert stats["due_count"] == 2
+    assert stats["planned_read_calls"] == 1
+    assert stats["read_calls"] == 1
+    assert stats["sampled_count"] == 2
+    assert stats["merge_saved_calls"] == 1
+    assert stats["merge_ratio"] == 50.0
+
+
+def test_memory_watch_manager_applies_read_call_budget():
+    calls = []
+    base = 0x20000000
+
+    def read_memory(address, size):
+        calls.append((address, size))
+        return bytes([len(calls), 0, 0, 0])
+
+    mgr = MemoryWatchManager(
+        read_memory=read_memory,
+        on_update=lambda items: None,
+        max_read_calls_per_cycle=1,
+        merge_gap=0,
+    )
+    mgr.add_item("a", base, "u32", period_ms=50)
+    mgr.add_item("b", base + 0x100, "u32", period_ms=50)
+    mgr.add_item("c", base + 0x200, "u32", period_ms=50)
+
+    assert mgr._sample_due_items(_due_items(mgr)) is True
+
+    assert calls == [(base, 4)]
+    stats = mgr.get_stats()
+    assert stats["due_count"] == 3
+    assert stats["planned_read_calls"] == 3
+    assert stats["read_calls"] == 1
+    assert stats["sampled_count"] == 1
+    assert stats["skipped_count"] == 2
+    assert stats["budget_limited"] is True
+    assert stats["budget_reason"] == "read_calls"
+    items = {item["name"]: item for item in mgr.list_items()}
+    assert items["a"]["read_count"] == 1
+    assert items["b"]["read_count"] == 0
+    assert items["c"]["read_count"] == 0
+
+
 def test_load_axf_symbols_from_minimal_elf_symtab(tmp_path):
     path = tmp_path / "test.axf"
     data = bytearray(0x340)

@@ -62,6 +62,15 @@ def test_gui_components():
         )
         assert "重连中" in app.jlink_status_var.get()
         assert "自动重连 1/3" in app.jlink_status_var.get()
+        assert hasattr(app, "reset_btn")
+        assert app.reset_btn.cget("state") == tk.DISABLED
+        app._refresh_connection_ui(True)
+        assert app.reset_btn.cget("state") == tk.NORMAL
+        with mock.patch.object(app.core, "reset_target", return_value=True) as reset:
+            app.reset_target()
+        reset.assert_called_once()
+        app._refresh_connection_ui(False)
+        assert app.reset_btn.cget("state") == tk.DISABLED
 
         # 变量监控控件
         assert hasattr(app, "watch_toggle_btn")
@@ -87,8 +96,20 @@ def test_gui_components():
                     "value": "1 (0x00000001)",
                     "error": "",
                 }
-            ]
+            ],
+            running=True,
+            stats={
+                "due_count": 2,
+                "sampled_count": 1,
+                "read_calls": 1,
+                "planned_read_calls": 1,
+                "bytes_requested": 8,
+                "duration_ms": 0.5,
+                "merge_saved_calls": 1,
+            },
         )
+        assert "本轮 1/2" in app.watch_status_var.get()
+        assert "合并省 1 次" in app.watch_status_var.get()
         app.watch_tree.selection_set("w1")
         copied = app.copy_watch_selection()
         assert "名称" in copied

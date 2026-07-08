@@ -231,6 +231,21 @@ def test_send_echo(core, fake_jlink):
     assert any("发送" in o for o in outs)
 
 
+def test_reset_target_uses_active_jlink(core, fake_jlink):
+    with pytest.raises(RTTError) as not_connected:
+        core.reset_target()
+    assert not_connected.value.kind == "not_connected"
+
+    _patched_connect(core, fake_jlink)
+    try:
+        assert core.reset_target() is True
+        fake_jlink.reset.assert_called_once()
+        lines, _ = core.get_output()
+        assert "复位目标" in "".join(lines)
+    finally:
+        core.disconnect()
+
+
 def test_send_error_triggers_recovery(core, fake_jlink):
     _patched_connect(core, fake_jlink)
     fake_jlink.rtt_write.side_effect = RuntimeError("Unspecified error")
@@ -369,6 +384,8 @@ def test_memory_watch_emits_updates(core, fake_jlink):
     assert watch_events[-1]["items"][0]["raw"] == "78 56 34 12"
     assert watch_events[-1]["items"][0]["read_count"] >= 1
     assert watch_events[-1]["items"][0]["fail_count"] == 0
+    assert watch_events[-1]["stats"]["read_calls"] >= 1
+    assert watch_events[-1]["stats"]["sampled_count"] >= 1
 
 
 def test_disconnect(core, fake_jlink):

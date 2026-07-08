@@ -7,7 +7,12 @@ from unittest import mock
 
 import pytest
 
-from cnrtt.agent_server import AgentServer, ERR_AUTH_FAILED, ERR_METHOD_NOT_FOUND
+from cnrtt.agent_server import (
+    AgentServer,
+    ERR_AUTH_FAILED,
+    ERR_INVALID_PARAMS,
+    ERR_METHOD_NOT_FOUND,
+)
 from cnrtt.agent_client import AgentClient, AgentError
 from cnrtt.core import RTTCore, RTTError
 
@@ -147,8 +152,10 @@ def test_agent_history_via_rpc(server_factory):
 def _patch_pylink():
     jlink = mock.MagicMock()
     jlink.connected.return_value = True
+    jlink.target_connected.return_value = True
     jlink.rtt_read.return_value = []
     jlink.rtt_write.side_effect = lambda ch, data: len(data)
+    jlink.memory_read8.return_value = [0x78, 0x56, 0x34, 0x12]
     pl = mock.MagicMock()
     pl.JLink.return_value = jlink
     pl.enums.JLinkInterfaces.SWD = "SWD"
@@ -170,6 +177,100 @@ def test_connect_and_send_and_disconnect(server_factory):
         r3 = c.call("disconnect")
         assert r3["connected"] is False
     finally:
+        patcher.stop()
+        c.close()
+
+
+def test_reset_and_read_memory_rpc(server_factory):
+    srv, core, port = server_factory()
+    _wait_server_ready(port)
+    c = AgentClient("127.0.0.1", port)
+    patcher, jlink = _patch_pylink()
+    patcher.start()
+    try:
+        c.call("connect", {"device": "STM32F407VE"})
+        reset = c.call("reset")
+        assert reset == {"ok": True}
+        jlink.reset.assert_called_once()
+
+        result = c.call("read_memory", {"address": "0x20000000", "size": "4"})
+        assert result == {
+            "address": 0x20000000,
+            "size": 4,
+            "hex": "78 56 34 12",
+            "bytes": [0x78, 0x56, 0x34, 0x12],
+        }
+        jlink.memory_read8.assert_called_with(0x20000000, 4)
+    finally:
+        try:
+            c.call("disconnect")
+        except Exception:
+            pass
+        patcher.stop()
+        c.close()
+
+
+def test_read_memory_invalid_params_rpc(server_factory):
+    srv, core, port = server_factory()
+    _wait_server_ready(port)
+    c = AgentClient("127.0.0.1", port)
+    try:
+        with pytest.raises(AgentError) as err:
+            c.call("read_memory", {"address": "bad", "size": 4})
+        assert err.value.code == ERR_INVALID_PARAMS
+    finally:
+        c.close()
+
+
+def test_watch_control_rpc(server_factory):
+    srv, core, port = server_factory()
+    _wait_server_ready(port)
+    c = AgentClient("127.0.0.1", port)
+    patcher, jlink = _patch_pylink()
+    patcher.start()
+    try:
+        added = c.call(
+            "watch_add",
+            {
+                "name": "counter",
+                "address": "0x20000000",
+                "type": "u32",
+                "period_ms": 50,
+            },
+        )
+        assert added["name"] == "counter"
+        assert added["source"] == "agent"
+
+        listing = c.call("watch_list")
+        assert listing["running"] is False
+        assert listing["items"][0]["name"] == "counter"
+        assert "stats" in listing
+
+        c.call("watch_enable", {"id": added["id"], "enabled": False})
+        assert c.call("watch_list")["items"][0]["enabled"] is False
+        c.call("watch_enable", {"id": added["id"], "enabled": True})
+
+        c.call("connect", {"device": "STM32F407VE"})
+        assert c.call("watch_start") == {"running": True}
+        deadline = time.monotonic() + 1.0
+        latest = {}
+        while time.monotonic() < deadline:
+            latest = c.call("watch_list")
+            if latest["items"][0].get("read_count", 0) >= 1:
+                break
+            time.sleep(0.02)
+        assert latest["items"][0]["value"] == "305419896 (0x12345678)"
+        assert latest["stats"]["read_calls"] >= 1
+        assert c.call("watch_stop") == {"running": False}
+
+        assert c.call("watch_stats")["read_calls"] >= 1
+        assert c.call("watch_remove", {"id": added["id"]}) == {"ok": True}
+        assert c.call("watch_clear") == {"ok": True}
+    finally:
+        try:
+            c.call("disconnect")
+        except Exception:
+            pass
         patcher.stop()
         c.close()
 
@@ -260,3 +361,39 @@ def test_output_push_and_status_push(server_factory):
         c_watch.close()
         c_call.close()
         c_probe.close()
+
+
+def test_watch_push(server_factory):
+    srv, core, port = server_factory()
+    _wait_server_ready(port)
+    c_watch = AgentClient("127.0.0.1", port)
+    pushes = []
+    try:
+        c_watch.connect()
+        time.sleep(0.2)
+
+        stop = threading.Event()
+        t = threading.Thread(
+            target=c_watch.watch,
+            kwargs={
+                "on_watch": lambda payload: pushes.append(payload),
+                "stop_event": stop,
+            },
+            daemon=True,
+        )
+        t.start()
+
+        core.add_watch_item("counter", 0x20000000, "u32", period_ms=50)
+
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and not pushes:
+            time.sleep(0.02)
+        stop.set()
+        t.join(timeout=1.0)
+
+        assert pushes
+        assert pushes[-1]["items"][0]["name"] == "counter"
+        assert pushes[-1]["running"] is False
+        assert "stats" in pushes[-1]
+    finally:
+        c_watch.close()

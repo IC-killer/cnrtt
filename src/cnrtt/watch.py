@@ -51,6 +51,10 @@ TYPE_ALIASES = {
 SHF_ALLOC = 0x2
 MAX_DWARF_ARRAY_ELEMENTS = 256
 MAX_DWARF_EXPANSION_DEPTH = 6
+DEFAULT_WATCH_MAX_READ_CALLS = 64
+DEFAULT_WATCH_MAX_BYTES = 16 * 1024
+DEFAULT_WATCH_MAX_CYCLE_MS = 25.0
+DEFAULT_WATCH_MERGE_GAP = 16
 
 
 def normalize_value_type(value_type: str) -> str:
@@ -162,6 +166,30 @@ class WatchItem:
 
 
 @dataclass
+class _WatchRead:
+    item_id: str
+    address: int
+    size: int
+    value_type: str
+    period_ms: int
+
+
+@dataclass
+class _WatchReadBatch:
+    address: int
+    end: int
+    reads: List[_WatchRead] = field(default_factory=list)
+
+    @property
+    def size(self) -> int:
+        return max(0, self.end - self.address)
+
+    def add(self, read: _WatchRead) -> None:
+        self.reads.append(read)
+        self.end = max(self.end, read.address + read.size)
+
+
+@dataclass
 class AxfSymbol:
     name: str
     address: int
@@ -198,6 +226,10 @@ class MemoryWatchManager:
         self,
         read_memory: Callable[[int, int], bytes],
         on_update: Callable[[List[Dict[str, Any]]], None],
+        max_read_calls_per_cycle: int = DEFAULT_WATCH_MAX_READ_CALLS,
+        max_bytes_per_cycle: int = DEFAULT_WATCH_MAX_BYTES,
+        max_cycle_ms: float = DEFAULT_WATCH_MAX_CYCLE_MS,
+        merge_gap: int = DEFAULT_WATCH_MERGE_GAP,
     ) -> None:
         self._read_memory = read_memory
         self._on_update = on_update
@@ -206,11 +238,38 @@ class MemoryWatchManager:
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._running = False
+        self._max_read_calls_per_cycle = max(1, int(max_read_calls_per_cycle or 1))
+        self._max_bytes_per_cycle = max(1, int(max_bytes_per_cycle or 1))
+        self._max_cycle_ms = max(0.0, float(max_cycle_ms or 0.0))
+        self._merge_gap = max(0, int(merge_gap or 0))
+        self._stats: Dict[str, Any] = self._empty_stats()
 
     @property
     def is_running(self) -> bool:
         with self._lock:
             return self._running
+
+    def get_stats(self) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self._stats)
+
+    @staticmethod
+    def _empty_stats() -> Dict[str, Any]:
+        return {
+            "last_cycle_at": 0.0,
+            "duration_ms": 0.0,
+            "due_count": 0,
+            "sampled_count": 0,
+            "failed_count": 0,
+            "skipped_count": 0,
+            "planned_read_calls": 0,
+            "read_calls": 0,
+            "bytes_requested": 0,
+            "merge_saved_calls": 0,
+            "merge_ratio": 0.0,
+            "budget_limited": False,
+            "budget_reason": "",
+        }
 
     def add_item(
         self,
@@ -311,41 +370,170 @@ class MemoryWatchManager:
             if not due_items:
                 continue
 
-            changed = False
-            for item in due_items:
-                started = time.monotonic()
-                value = ""
-                raw_hex = ""
-                latency_ms = 0.0
-                try:
-                    raw = self._read_memory(item.address, value_type_size(item.value_type))
-                    raw_hex = _format_raw_bytes(raw)
-                    value = format_watch_value(raw, item.value_type)
-                    error = ""
-                except Exception as e:
-                    error = str(e)
-                finally:
-                    latency_ms = (time.monotonic() - started) * 1000.0
-
-                with self._lock:
-                    current = self._items.get(item.item_id)
-                    if not current:
-                        continue
-                    current.read_count += 1
-                    current.latency_ms = round(latency_ms, 3)
-                    if error:
-                        current.last_error = error
-                        current.fail_count += 1
-                    else:
-                        current.last_value = value
-                        current.last_raw = raw_hex
-                        current.last_error = ""
-                    current.updated_at = time.time()
-                    current.next_due = time.monotonic() + current.period_ms / 1000.0
-                    changed = True
-
+            changed = self._sample_due_items(due_items)
             if changed:
                 self._emit_snapshot()
+
+    def _sample_due_items(self, due_items: List[WatchItem]) -> bool:
+        cycle_started = time.monotonic()
+        reads = [
+            _WatchRead(
+                item_id=item.item_id,
+                address=item.address,
+                size=value_type_size(item.value_type),
+                value_type=item.value_type,
+                period_ms=item.period_ms,
+            )
+            for item in due_items
+        ]
+        batches = self._build_read_batches(reads)
+        stats = self._empty_stats()
+        stats["last_cycle_at"] = time.time()
+        stats["due_count"] = len(reads)
+        stats["planned_read_calls"] = len(batches)
+        stats["merge_saved_calls"] = max(0, len(reads) - len(batches))
+        if reads:
+            stats["merge_ratio"] = round(stats["merge_saved_calls"] * 100.0 / len(reads), 1)
+
+        changed = False
+        for batch_index, batch in enumerate(batches):
+            budget_reason = self._budget_reason(stats, batch, cycle_started)
+            if budget_reason:
+                skipped = self._skip_batches(batches[batch_index:])
+                stats["skipped_count"] += skipped
+                stats["budget_limited"] = True
+                stats["budget_reason"] = budget_reason
+                changed = True
+                break
+
+            started = time.monotonic()
+            stats["read_calls"] += 1
+            stats["bytes_requested"] += batch.size
+            try:
+                raw = bytes(self._read_memory(batch.address, batch.size))
+                if len(raw) < batch.size:
+                    raise WatchError(f"读取字节数不足: {len(raw)}/{batch.size}")
+                latency_ms = (time.monotonic() - started) * 1000.0
+                sampled, failed = self._apply_batch_data(batch, raw, latency_ms)
+            except Exception as e:
+                latency_ms = (time.monotonic() - started) * 1000.0
+                sampled, failed = 0, self._apply_batch_error(batch, str(e), latency_ms)
+            stats["sampled_count"] += sampled
+            stats["failed_count"] += failed
+            changed = True
+
+        stats["duration_ms"] = round((time.monotonic() - cycle_started) * 1000.0, 3)
+        with self._lock:
+            self._stats = stats
+        return changed
+
+    def _build_read_batches(self, reads: List[_WatchRead]) -> List[_WatchReadBatch]:
+        batches: List[_WatchReadBatch] = []
+        for read in sorted(reads, key=lambda item: (item.address, item.size)):
+            if not batches:
+                batches.append(
+                    _WatchReadBatch(
+                        address=read.address,
+                        end=read.address + read.size,
+                        reads=[read],
+                    )
+                )
+                continue
+            current = batches[-1]
+            proposed_end = max(current.end, read.address + read.size)
+            proposed_size = proposed_end - current.address
+            if read.address <= current.end + self._merge_gap and proposed_size <= self._max_bytes_per_cycle:
+                current.add(read)
+            else:
+                batches.append(
+                    _WatchReadBatch(
+                        address=read.address,
+                        end=read.address + read.size,
+                        reads=[read],
+                    )
+                )
+        return batches
+
+    def _budget_reason(
+        self,
+        stats: Dict[str, Any],
+        batch: _WatchReadBatch,
+        cycle_started: float,
+    ) -> str:
+        if int(stats["read_calls"]) >= self._max_read_calls_per_cycle:
+            return "read_calls"
+        if int(stats["bytes_requested"]) + batch.size > self._max_bytes_per_cycle:
+            return "bytes"
+        if self._max_cycle_ms > 0:
+            elapsed_ms = (time.monotonic() - cycle_started) * 1000.0
+            if elapsed_ms >= self._max_cycle_ms:
+                return "time"
+        return ""
+
+    def _apply_batch_data(
+        self,
+        batch: _WatchReadBatch,
+        raw: bytes,
+        latency_ms: float,
+    ) -> Tuple[int, int]:
+        sampled = 0
+        failed = 0
+        with self._lock:
+            for read in batch.reads:
+                current = self._items.get(read.item_id)
+                if not current:
+                    continue
+                offset = read.address - batch.address
+                chunk = raw[offset : offset + read.size]
+                try:
+                    value = format_watch_value(chunk, read.value_type)
+                    current.last_value = value
+                    current.last_raw = _format_raw_bytes(chunk)
+                    current.last_error = ""
+                    sampled += 1
+                except Exception as e:
+                    current.last_error = str(e)
+                    current.fail_count += 1
+                    failed += 1
+                current.read_count += 1
+                current.latency_ms = round(latency_ms, 3)
+                current.updated_at = time.time()
+                current.next_due = time.monotonic() + current.period_ms / 1000.0
+        return sampled, failed
+
+    def _apply_batch_error(
+        self,
+        batch: _WatchReadBatch,
+        error: str,
+        latency_ms: float,
+    ) -> int:
+        failed = 0
+        with self._lock:
+            for read in batch.reads:
+                current = self._items.get(read.item_id)
+                if not current:
+                    continue
+                current.read_count += 1
+                current.fail_count += 1
+                current.latency_ms = round(latency_ms, 3)
+                current.last_error = error
+                current.updated_at = time.time()
+                current.next_due = time.monotonic() + current.period_ms / 1000.0
+                failed += 1
+        return failed
+
+    def _skip_batches(self, batches: List[_WatchReadBatch]) -> int:
+        skipped = 0
+        with self._lock:
+            now = time.monotonic()
+            for batch in batches:
+                for read in batch.reads:
+                    current = self._items.get(read.item_id)
+                    if not current:
+                        continue
+                    current.next_due = now + current.period_ms / 1000.0
+                    skipped += 1
+        return skipped
 
     def _emit_snapshot(self) -> None:
         with self._lock:

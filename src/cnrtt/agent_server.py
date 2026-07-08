@@ -30,6 +30,7 @@ from cnrtt.core import (
     EVENT_ERROR,
     EVENT_OUTPUT,
     EVENT_STATUS,
+    EVENT_WATCH,
     RTTCore,
     RTTError,
 )
@@ -211,6 +212,15 @@ class _ClientHandler:
             self._send_notify("status", {"connected": payload.get("connected", False)})
         elif event_type == EVENT_ERROR:
             self._send_notify("error", {"message": payload.get("message", "")})
+        elif event_type == EVENT_WATCH:
+            self._send_notify(
+                "watch",
+                {
+                    "items": payload.get("items", []),
+                    "running": payload.get("running", False),
+                    "stats": payload.get("stats", {}),
+                },
+            )
 
     def _flush_batch(self, force: bool = False) -> None:
         with self._batch_lock:
@@ -283,13 +293,23 @@ class _ClientHandler:
             if msg_id is not None:
                 self._send_error(msg_id, ERR_INVALID_REQUEST, "missing method")
             return
+        if not isinstance(params, dict):
+            if msg_id is not None:
+                self._send_error(msg_id, ERR_INVALID_PARAMS, "params must be object")
+            return
         try:
             result = self._dispatch(method, params)
             if msg_id is not None:
                 self._send_response(msg_id, result)
         except RTTError as e:
             if msg_id is not None:
-                self._send_error(msg_id, ERR_NOT_CONNECTED if "not connected" in str(e).lower() else ERR_INTERNAL, str(e))
+                if getattr(e, "kind", "") == "invalid_params":
+                    code = ERR_INVALID_PARAMS
+                elif "not connected" in str(e).lower():
+                    code = ERR_NOT_CONNECTED
+                else:
+                    code = ERR_INTERNAL
+                self._send_error(msg_id, code, str(e))
         except _RpcError as e:
             if msg_id is not None:
                 self._send_error(msg_id, e.code, e.message)
@@ -298,6 +318,32 @@ class _ClientHandler:
                 self._send_error(msg_id, ERR_INTERNAL, f"internal error: {e}")
 
     # ── 方法分发 ──────────────────────────────────────────────
+    @staticmethod
+    def _parse_int_param(params: dict, name: str, default: Any = None) -> int:
+        value = params.get(name, default)
+        if value is None:
+            raise _RpcError(ERR_INVALID_PARAMS, f"{name} required")
+        try:
+            if isinstance(value, int):
+                return value
+            return int(str(value).strip(), 0)
+        except (TypeError, ValueError) as e:
+            raise _RpcError(ERR_INVALID_PARAMS, f"{name} invalid") from e
+
+    @staticmethod
+    def _parse_bool_param(params: dict, name: str, default: bool = False) -> bool:
+        value = params.get(name, default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int):
+            return bool(value)
+        text = str(value).strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+        raise _RpcError(ERR_INVALID_PARAMS, f"{name} invalid")
+
     def _dispatch(self, method: str, params: dict) -> Any:
         if method == "status":
             return self.core.get_config()
@@ -320,6 +366,11 @@ class _ClientHandler:
             self.core.append_agent_history("disconnect")
             self.core.save_agent_history()
             return {"connected": False}
+        if method == "reset":
+            self.core.reset_target()
+            self.core.append_agent_history("reset")
+            self.core.save_agent_history()
+            return {"ok": True}
         if method == "send":
             text = params.get("text")
             if text is None or not isinstance(text, str):
@@ -330,14 +381,71 @@ class _ClientHandler:
             self.core.save_agent_history()
             return {"bytes_sent": n}
         if method == "get_output":
-            since = int(params.get("since", 0))
-            limit = int(params.get("limit", 10000))
-            clear = bool(params.get("clear", False))
+            since = self._parse_int_param(params, "since", 0)
+            limit = self._parse_int_param(params, "limit", 10000)
+            clear = self._parse_bool_param(params, "clear", False)
             lines, cursor = self.core.get_output(since=since, limit=limit, clear=clear)
             return {"lines": lines, "next_cursor": cursor}
         if method == "clear_output":
             self.core.clear_output()
             return {"ok": True}
+        if method == "read_memory":
+            if "address" not in params or "size" not in params:
+                raise _RpcError(ERR_INVALID_PARAMS, "address and size required")
+            address = self._parse_int_param(params, "address")
+            size = self._parse_int_param(params, "size")
+            data = self.core.read_memory(address, size)
+            return {
+                "address": address,
+                "size": len(data),
+                "hex": data.hex(" "),
+                "bytes": list(data),
+            }
+        if method == "watch_list":
+            return {
+                "items": self.core.list_watch_items(
+                    include_runtime=self._parse_bool_param(params, "include_runtime", True)
+                ),
+                "running": self.core.memory_watch_running(),
+                "stats": self.core.get_memory_watch_stats(),
+            }
+        if method == "watch_add":
+            if "name" not in params or "address" not in params:
+                raise _RpcError(ERR_INVALID_PARAMS, "name and address required")
+            return self.core.add_watch_item(
+                name=str(params.get("name")),
+                address=params.get("address"),
+                value_type=str(params.get("type") or params.get("value_type") or "u32"),
+                period_ms=self._parse_int_param(params, "period_ms", 500),
+                enabled=self._parse_bool_param(params, "enabled", True),
+                source=str(params.get("source") or "agent"),
+            )
+        if method == "watch_remove":
+            item_id = params.get("id")
+            if not item_id:
+                raise _RpcError(ERR_INVALID_PARAMS, "id required")
+            self.core.remove_watch_item(str(item_id))
+            return {"ok": True}
+        if method == "watch_clear":
+            self.core.clear_watch_items()
+            return {"ok": True}
+        if method == "watch_enable":
+            item_id = params.get("id")
+            if not item_id:
+                raise _RpcError(ERR_INVALID_PARAMS, "id required")
+            self.core.set_watch_item_enabled(
+                str(item_id),
+                self._parse_bool_param(params, "enabled", True),
+            )
+            return {"ok": True}
+        if method == "watch_start":
+            self.core.start_memory_watch()
+            return {"running": True}
+        if method == "watch_stop":
+            self.core.stop_memory_watch()
+            return {"running": False}
+        if method == "watch_stats":
+            return self.core.get_memory_watch_stats()
         if method == "get_config":
             return self.core.get_config()
         if method == "set_config":

@@ -302,6 +302,14 @@ class RTTViewerApp:
         self.connect_btn = tk.Button(top_frame, text="连接", command=self.toggle_connection)
         self.connect_btn.grid(row=0, column=6, padx=10)
 
+        self.reset_btn = tk.Button(
+            top_frame,
+            text="复位",
+            command=self.reset_target,
+            state=tk.DISABLED,
+        )
+        self.reset_btn.grid(row=0, column=7, padx=(0, 10))
+
         self.jlink_status_var = tk.StringVar(value="J-Link: 未连接")
         self.jlink_status_label = tk.Label(
             top_frame,
@@ -309,11 +317,11 @@ class RTTViewerApp:
             anchor="w",
             fg="#555555",
         )
-        self.jlink_status_label.grid(row=0, column=7, sticky="ew", padx=(0, 10))
+        self.jlink_status_label.grid(row=0, column=8, sticky="ew", padx=(0, 10))
 
-        top_frame.grid_columnconfigure(7, weight=1)
+        top_frame.grid_columnconfigure(8, weight=1)
         watch_toolbar = tk.Frame(top_frame)
-        watch_toolbar.grid(row=0, column=8, sticky="e")
+        watch_toolbar.grid(row=0, column=9, sticky="e")
 
         self.watch_panel_visible = bool(self.history.get("watch_panel_visible", False))
         self.watch_toggle_btn = tk.Button(
@@ -1120,7 +1128,34 @@ class RTTViewerApp:
         self.watch_run_btn.config(text="停止采样")
         self.watch_status_var.set("采样中")
 
-    def _refresh_watch_table(self, items, running: Optional[bool] = None):
+    def _format_watch_stats(self, stats: Optional[Dict[str, Any]]) -> str:
+        if not stats or not stats.get("due_count"):
+            return ""
+        parts = [
+            f"本轮 {stats.get('sampled_count', 0)}/{stats.get('due_count', 0)}",
+            f"读 {stats.get('read_calls', 0)}/{stats.get('planned_read_calls', 0)} 次",
+            f"{stats.get('bytes_requested', 0)}B",
+            f"{stats.get('duration_ms', 0)}ms",
+        ]
+        merge_saved = int(stats.get("merge_saved_calls") or 0)
+        if merge_saved:
+            parts.append(f"合并省 {merge_saved} 次")
+        skipped = int(stats.get("skipped_count") or 0)
+        if skipped:
+            parts.append(f"跳过 {skipped}")
+        failed = int(stats.get("failed_count") or 0)
+        if failed:
+            parts.append(f"失败 {failed}")
+        if stats.get("budget_limited"):
+            parts.append(f"预算限制:{stats.get('budget_reason', '')}")
+        return "，".join(parts)
+
+    def _refresh_watch_table(
+        self,
+        items,
+        running: Optional[bool] = None,
+        stats: Optional[Dict[str, Any]] = None,
+    ):
         self._watch_rows = {item["id"]: item for item in items}
         existing = set(self.watch_tree.get_children())
         incoming = set(self._watch_rows)
@@ -1157,6 +1192,10 @@ class RTTViewerApp:
                 self.watch_tree.insert("", tk.END, iid=item_id, values=values)
         if running is not None:
             self.watch_run_btn.config(text="停止采样" if running else "开始采样")
+        stats_text = self._format_watch_stats(stats)
+        if stats_text:
+            state = "采样中" if running else "采样停止"
+            self.watch_status_var.set(f"{state}，{stats_text}")
 
     @staticmethod
     def _validate_agent_port_chars(value):
@@ -1326,16 +1365,19 @@ class RTTViewerApp:
             self._refresh_watch_table(
                 payload.get("items", []),
                 running=payload.get("running"),
+                stats=payload.get("stats"),
             )
 
     def _refresh_connection_ui(self, connected):
         if connected:
             self.connect_btn.config(text="断开")
+            self.reset_btn.config(state=tk.NORMAL)
             self.device_combo.config(state=tk.DISABLED)
             self.iface_combo.config(state=tk.DISABLED)
             self.charset_combo.config(state=tk.DISABLED)
         else:
             self.connect_btn.config(text="连接")
+            self.reset_btn.config(state=tk.DISABLED)
             self.device_combo.config(state="normal")
             self.iface_combo.config(state="readonly")
             self.charset_combo.config(state="readonly")
@@ -1455,6 +1497,12 @@ class RTTViewerApp:
             self.core.disconnect()
         except RTTError:
             pass
+
+    def reset_target(self):
+        try:
+            self.core.reset_target()
+        except RTTError as e:
+            self.append_output(f"[复位错误] {e}\n")
 
     def send_input(self, event=None):
         text = self.input_entry.get()

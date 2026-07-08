@@ -3,7 +3,7 @@
 提供两个用途：
 1. AgentClient 类 —— AI agent 集成时直接 copy 使用（纯 stdlib）。
 2. CLI 入口 —— 人工调试协议：status / connect / disconnect / send /
-   get_output / clear / config / watch / history。
+   get_output / clear / config / reset / read_memory / watch 控制 / history。
 
 传输协议与 agent_server.py 一致：4 字节大端长度前缀 + JSON-RPC 2.0。
 """
@@ -114,6 +114,7 @@ class AgentClient:
         on_output: Optional[Any] = None,
         on_status: Optional[Any] = None,
         on_error: Optional[Any] = None,
+        on_watch: Optional[Any] = None,
         stop_event: Optional[threading.Event] = None,
     ) -> None:
         """持续监听服务端 notify，直到 stop_event 被设置或连接断开。"""
@@ -136,6 +137,8 @@ class AgentClient:
                     on_status(params.get("connected"))
                 elif method == "error" and on_error:
                     on_error(params.get("message", ""))
+                elif method == "watch" and on_watch:
+                    on_watch(params)
 
     # ── 底层读写 ──────────────────────────────────────────────
     def _send_json(self, obj: dict) -> None:
@@ -190,6 +193,13 @@ def _print_json(obj: Any) -> None:
     print(json.dumps(obj, ensure_ascii=False, indent=2))
 
 
+def _parse_cli_int(value: str) -> int:
+    try:
+        return int(str(value).strip(), 0)
+    except (TypeError, ValueError) as e:
+        raise argparse.ArgumentTypeError(f"非法整数: {value}") from e
+
+
 def cli_main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="cnrtt-agent-client",
@@ -202,6 +212,7 @@ def cli_main(argv=None) -> int:
 
     sub.add_parser("status", help="查询当前状态")
     sub.add_parser("disconnect", help="断开 RTT")
+    sub.add_parser("reset", help="通过 J-Link 复位目标")
 
     p_conn = sub.add_parser("connect", help="连接 RTT")
     p_conn.add_argument("--device", default=None)
@@ -218,6 +229,45 @@ def cli_main(argv=None) -> int:
     p_get.add_argument("--clear", action="store_true")
 
     sub.add_parser("clear", help="清空输出缓冲")
+
+    p_mem = sub.add_parser("read_memory", help="读取目标内存")
+    p_mem.add_argument("--address", required=True, help="地址，如 0x20000000")
+    p_mem.add_argument(
+        "--size",
+        required=True,
+        type=_parse_cli_int,
+        help="读取字节数，如 4 或 0x10",
+    )
+
+    p_watch_list = sub.add_parser("watch_list", help="列出变量监控项")
+    p_watch_list.add_argument(
+        "--no-runtime",
+        action="store_true",
+        help="不返回当前值/错误/计数等运行态字段",
+    )
+
+    p_watch_add = sub.add_parser("watch_add", help="添加变量监控项")
+    p_watch_add.add_argument("--name", required=True)
+    p_watch_add.add_argument("--address", required=True)
+    p_watch_add.add_argument("--type", default="u32")
+    p_watch_add.add_argument("--period-ms", type=int, default=500)
+    p_watch_add.add_argument("--disabled", action="store_true")
+    p_watch_add.add_argument("--source", default="agent")
+
+    p_watch_remove = sub.add_parser("watch_remove", help="移除变量监控项")
+    p_watch_remove.add_argument("--id", required=True)
+
+    sub.add_parser("watch_clear", help="清空变量监控项")
+
+    p_watch_enable = sub.add_parser("watch_enable", help="启用或禁用变量监控项")
+    p_watch_enable.add_argument("--id", required=True)
+    state = p_watch_enable.add_mutually_exclusive_group()
+    state.add_argument("--enabled", action="store_true")
+    state.add_argument("--disabled", action="store_true")
+
+    sub.add_parser("watch_start", help="开始变量采样")
+    sub.add_parser("watch_stop", help="停止变量采样")
+    sub.add_parser("watch_stats", help="查看最近一轮变量采样统计")
 
     p_cfg = sub.add_parser("config", help="查询或设置配置")
     p_cfg.add_argument("--set", nargs="*", default=None, help="key=value 形式设置")
@@ -246,6 +296,8 @@ def cli_main(argv=None) -> int:
             _print_json(client.call("connect", params))
         elif args.command == "disconnect":
             _print_json(client.call("disconnect"))
+        elif args.command == "reset":
+            _print_json(client.call("reset"))
         elif args.command == "send":
             _print_json(
                 client.call(
@@ -262,6 +314,54 @@ def cli_main(argv=None) -> int:
             )
         elif args.command == "clear":
             _print_json(client.call("clear_output"))
+        elif args.command == "read_memory":
+            _print_json(
+                client.call(
+                    "read_memory",
+                    {
+                        "address": args.address,
+                        "size": args.size,
+                    },
+                )
+            )
+        elif args.command == "watch_list":
+            _print_json(
+                client.call(
+                    "watch_list",
+                    {"include_runtime": not args.no_runtime},
+                )
+            )
+        elif args.command == "watch_add":
+            _print_json(
+                client.call(
+                    "watch_add",
+                    {
+                        "name": args.name,
+                        "address": args.address,
+                        "type": args.type,
+                        "period_ms": args.period_ms,
+                        "enabled": not args.disabled,
+                        "source": args.source,
+                    },
+                )
+            )
+        elif args.command == "watch_remove":
+            _print_json(client.call("watch_remove", {"id": args.id}))
+        elif args.command == "watch_clear":
+            _print_json(client.call("watch_clear"))
+        elif args.command == "watch_enable":
+            _print_json(
+                client.call(
+                    "watch_enable",
+                    {"id": args.id, "enabled": not args.disabled},
+                )
+            )
+        elif args.command == "watch_start":
+            _print_json(client.call("watch_start"))
+        elif args.command == "watch_stop":
+            _print_json(client.call("watch_stop"))
+        elif args.command == "watch_stats":
+            _print_json(client.call("watch_stats"))
         elif args.command == "config":
             if args.set:
                 params = {}
@@ -304,11 +404,18 @@ def cli_main(argv=None) -> int:
                     flush=True,
                 )
 
+            def on_watch(payload):
+                print(
+                    json.dumps({"watch": payload}, ensure_ascii=False),
+                    flush=True,
+                )
+
             try:
                 client.watch(
                     on_output=on_output,
                     on_status=on_status,
                     on_error=on_error,
+                    on_watch=on_watch,
                     stop_event=stop,
                 )
             except KeyboardInterrupt:

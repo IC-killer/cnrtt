@@ -143,7 +143,7 @@ class RTTCore:
         # agent 命令历史（由 agent_server 维护，core 提供存取）
         self._agent_history: List[str] = []
 
-        # 变量运行态监控（GUI 使用，agent JSON-RPC 暂不暴露）
+        # 变量运行态监控（GUI 和 agent JSON-RPC 共享）
         self._watch_manager = MemoryWatchManager(
             read_memory=self.read_memory,
             on_update=self._emit_watch_update,
@@ -586,6 +586,26 @@ class RTTCore:
                 self._schedule_recovery(f"发送失败: {e}")
                 raise RTTError(f"send error: {e}") from e
 
+    def reset_target(self) -> bool:
+        """Reset target MCU through the active J-Link session."""
+        try:
+            with self._jlink_io_lock:
+                if not self._connected or not self._jlink:
+                    raise RTTError("not connected", kind="not_connected")
+                self._jlink.reset()
+            self._emit_output("[系统] 已通过 J-Link 复位目标。\n")
+            return True
+        except RTTError:
+            raise
+        except Exception as e:
+            msg = f"reset error: {e}"
+            self._emit(EVENT_ERROR, {"message": msg})
+            with self._lock:
+                self._set_jlink_status("异常", msg)
+            self._emit_status()
+            self._schedule_recovery(f"复位失败: {e}")
+            raise RTTError(msg) from e
+
     # ── 输出拉取 ──────────────────────────────────────────────
     def get_output(
         self, since: int = 0, limit: int = 10000, clear: bool = False
@@ -769,9 +789,12 @@ class RTTCore:
     def list_watch_items(self, include_runtime: bool = True) -> List[Dict[str, Any]]:
         return self._watch_manager.list_items(include_runtime=include_runtime)
 
+    def get_memory_watch_stats(self) -> Dict[str, Any]:
+        return self._watch_manager.get_stats()
+
     def start_memory_watch(self) -> bool:
         if not self.is_connected:
-            raise RTTError("not connected")
+            raise RTTError("not connected", kind="not_connected")
         return self._watch_manager.start()
 
     def stop_memory_watch(self) -> None:
@@ -789,7 +812,14 @@ class RTTCore:
             raise RTTError(f"AXF 加载失败: {e}") from e
 
     def _emit_watch_update(self, items: List[Dict[str, Any]]) -> None:
-        self._emit(EVENT_WATCH, {"items": items, "running": self.memory_watch_running()})
+        self._emit(
+            EVENT_WATCH,
+            {
+                "items": items,
+                "running": self.memory_watch_running(),
+                "stats": self.get_memory_watch_stats(),
+            },
+        )
 
     # ── 配置 ──────────────────────────────────────────────────
     def get_config(self) -> Dict[str, Any]:
