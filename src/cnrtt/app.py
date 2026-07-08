@@ -18,9 +18,11 @@ from cnrtt.core import (
     EVENT_ERROR,
     EVENT_OUTPUT,
     EVENT_STATUS,
+    EVENT_WATCH,
     RTTCore,
     RTTError,
 )
+from cnrtt.watch import VALUE_TYPES
 
 # ANSI 颜色码到 RGB 颜色的映射
 ANSI_COLORS = {
@@ -243,7 +245,8 @@ class RTTViewerApp:
     ):
         self.root = root
         self.root.title("CN RTT Viewer (支持中文及色彩)")
-        self.root.geometry("760x540")
+        self.root.geometry("980x620")
+        self.root.minsize(860, 560)
 
         # 业务核心：可由外部注入（GUI+agent 共享同一 core），否则自建
         self.core = core if core is not None else RTTCore()
@@ -298,6 +301,41 @@ class RTTViewerApp:
         self.connect_btn = tk.Button(top_frame, text="连接", command=self.toggle_connection)
         self.connect_btn.grid(row=0, column=6, padx=10)
 
+        self.jlink_status_var = tk.StringVar(value="J-Link: 未连接")
+        self.jlink_status_label = tk.Label(
+            top_frame,
+            textvariable=self.jlink_status_var,
+            anchor="w",
+            fg="#555555",
+        )
+        self.jlink_status_label.grid(row=0, column=7, sticky="ew", padx=(0, 10))
+
+        top_frame.grid_columnconfigure(7, weight=1)
+        watch_toolbar = tk.Frame(top_frame)
+        watch_toolbar.grid(row=0, column=8, sticky="e")
+
+        self.watch_panel_visible = bool(self.history.get("watch_panel_visible", False))
+        self.watch_toggle_btn = tk.Button(
+            watch_toolbar,
+            text="变量",
+            command=self.toggle_watch_panel,
+        )
+        self.watch_toggle_btn.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.load_axf_btn = tk.Button(
+            watch_toolbar,
+            text="加载AXF",
+            command=self.load_axf_file,
+        )
+        self.load_axf_btn.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.watch_run_btn = tk.Button(
+            watch_toolbar,
+            text="开始采样",
+            command=self.toggle_memory_watch,
+        )
+        self.watch_run_btn.pack(side=tk.LEFT)
+
         # AI agent server 控制区
         agent_frame = tk.Frame(root, padx=10, pady=4)
         agent_frame.pack(fill=tk.X)
@@ -334,11 +372,43 @@ class RTTViewerApp:
         )
         self.agent_status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        # 中部日志输出区
-        mid_frame = tk.Frame(root, padx=10)
-        mid_frame.pack(fill=tk.BOTH, expand=True)
+        # 变量监控区
+        self.watch_symbols = []
+        self.watch_symbol_by_name = {}
+        self.watch_axf_path = str(self.history.get("watch_axf_path", "") or "")
+        self._watch_rows = {}
+        self._build_watch_panel(root)
+        self._restore_watch_items()
 
-        output_toolbar = tk.Frame(mid_frame)
+        # 底部输入区先占位，再让日志区填充剩余空间，避免变量面板打开时被挤掉。
+        self.bottom_frame = tk.Frame(root, padx=10, pady=10)
+        self.bottom_frame.pack(side=tk.BOTTOM, fill=tk.X)
+
+        self.input_entry = tk.Entry(self.bottom_frame, font=("Consolas", 10))
+        self.input_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.input_entry.bind("<Return>", self.send_input)
+        self.input_entry.bind("<Up>", self.input_history_up)
+        self.input_entry.bind("<Down>", self.input_history_down)
+
+        self.send_btn = tk.Button(self.bottom_frame, text="发送", command=self.send_input)
+        self.send_btn.pack(side=tk.LEFT, padx=10)
+
+        # 显示发送选项
+        self.echo_send_var = tk.BooleanVar(value=self.history.get("echo_send", False))
+        self.echo_send_cb = tk.Checkbutton(self.bottom_frame, text="显示发送", variable=self.echo_send_var, command=self._on_gui_option_changed)
+        self.echo_send_cb.pack(side=tk.LEFT, padx=5)
+
+        # 显示原始数据（Hex Dump）选项
+        self.hex_dump_var = tk.BooleanVar(value=self.history.get("hex_dump", False))
+        self.hex_dump_cb = tk.Checkbutton(self.bottom_frame, text="Hex", variable=self.hex_dump_var, command=self._on_gui_option_changed)
+        self.hex_dump_cb.pack(side=tk.LEFT, padx=5)
+
+        # 中部日志输出区
+        self.mid_frame = tk.Frame(root, padx=10)
+        self.mid_frame.pack(fill=tk.BOTH, expand=True)
+        self._set_watch_panel_visible(self.watch_panel_visible, persist=False)
+
+        output_toolbar = tk.Frame(self.mid_frame)
         output_toolbar.pack(fill=tk.X, pady=(0, 4))
 
         self.clear_output_btn = tk.Button(
@@ -363,7 +433,7 @@ class RTTViewerApp:
         self.pause_scroll_btn.pack(side=tk.LEFT)
         self.output_scroll_paused = False
 
-        self.output_text = scrolledtext.ScrolledText(mid_frame, wrap=tk.WORD, font=("Consolas", 10), bg="#1e1e1e", fg="#d4d4d4")
+        self.output_text = scrolledtext.ScrolledText(self.mid_frame, wrap=tk.WORD, height=8, font=("Consolas", 10), bg="#1e1e1e", fg="#d4d4d4")
         self.output_text.pack(fill=tk.BOTH, expand=True)
 
         # 预先配置颜色标签
@@ -376,29 +446,6 @@ class RTTViewerApp:
         self.popup_menu = tk.Menu(self.output_text, tearoff=0)
         self.popup_menu.add_command(label="复制", command=self.copy_text)
         self.output_text.bind("<Button-3>", self.show_popup)
-
-        # 底部输入区
-        bottom_frame = tk.Frame(root, padx=10, pady=10)
-        bottom_frame.pack(fill=tk.X)
-
-        self.input_entry = tk.Entry(bottom_frame, font=("Consolas", 10))
-        self.input_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.input_entry.bind("<Return>", self.send_input)
-        self.input_entry.bind("<Up>", self.input_history_up)
-        self.input_entry.bind("<Down>", self.input_history_down)
-
-        self.send_btn = tk.Button(bottom_frame, text="发送", command=self.send_input)
-        self.send_btn.pack(side=tk.LEFT, padx=10)
-
-        # 显示发送选项
-        self.echo_send_var = tk.BooleanVar(value=self.history.get("echo_send", False))
-        self.echo_send_cb = tk.Checkbutton(bottom_frame, text="显示发送", variable=self.echo_send_var, command=self._on_gui_option_changed)
-        self.echo_send_cb.pack(side=tk.LEFT, padx=5)
-
-        # 显示原始数据（Hex Dump）选项
-        self.hex_dump_var = tk.BooleanVar(value=self.history.get("hex_dump", False))
-        self.hex_dump_cb = tk.Checkbutton(bottom_frame, text="Hex", variable=self.hex_dump_var, command=self._on_gui_option_changed)
-        self.hex_dump_cb.pack(side=tk.LEFT, padx=5)
 
         # 输入历史记录（GUI 侧，与 agent 历史分离）
         self.input_history = self.history.get("input_history", [])
@@ -421,6 +468,7 @@ class RTTViewerApp:
         self._sub_id = self.core.subscribe(self._on_core_event_threadsafe)
         self._process_events()
         self._refresh_agent_ui()
+        self._refresh_jlink_status(self.core.get_config())
         self.root.after(0, self._focus_input)
         if self._agent_autostart:
             self.root.after(0, self.start_agent_server)
@@ -435,6 +483,360 @@ class RTTViewerApp:
 
     def _on_window_activated(self, event=None):
         self.root.after(0, self._focus_input)
+
+    # ── 变量监控 UI ──────────────────────────────────────────
+    def _build_watch_panel(self, root):
+        self.watch_panel = tk.Frame(root, padx=10, pady=4, relief=tk.GROOVE, bd=1)
+        self.watch_panel.pack(fill=tk.X)
+
+        editor = tk.Frame(self.watch_panel)
+        editor.pack(fill=tk.X, pady=(0, 4))
+
+        tk.Label(editor, text="变量:").pack(side=tk.LEFT)
+        self.watch_name_var = tk.StringVar()
+        self.watch_name_combo = ttk.Combobox(
+            editor,
+            textvariable=self.watch_name_var,
+            values=[],
+            width=22,
+        )
+        self.watch_name_combo.pack(side=tk.LEFT, padx=(4, 8))
+        self.watch_name_combo.bind("<<ComboboxSelected>>", self._on_watch_symbol_selected)
+
+        tk.Label(editor, text="地址:").pack(side=tk.LEFT)
+        self.watch_addr_var = tk.StringVar()
+        self.watch_addr_entry = tk.Entry(editor, textvariable=self.watch_addr_var, width=12)
+        self.watch_addr_entry.pack(side=tk.LEFT, padx=(4, 8))
+
+        tk.Label(editor, text="类型:").pack(side=tk.LEFT)
+        self.watch_type_var = tk.StringVar(value="u32")
+        self.watch_type_combo = ttk.Combobox(
+            editor,
+            textvariable=self.watch_type_var,
+            values=list(VALUE_TYPES.keys()),
+            width=8,
+            state="readonly",
+        )
+        self.watch_type_combo.pack(side=tk.LEFT, padx=(4, 8))
+
+        tk.Label(editor, text="周期ms:").pack(side=tk.LEFT)
+        self.watch_period_var = tk.StringVar(value="500")
+        self.watch_period_entry = tk.Entry(editor, textvariable=self.watch_period_var, width=7)
+        self.watch_period_entry.pack(side=tk.LEFT, padx=(4, 8))
+
+        self.watch_enabled_var = tk.BooleanVar(value=True)
+        self.watch_enabled_cb = tk.Checkbutton(
+            editor,
+            text="启用",
+            variable=self.watch_enabled_var,
+        )
+        self.watch_enabled_cb.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.watch_add_btn = tk.Button(editor, text="添加", command=self.add_watch_item)
+        self.watch_add_btn.pack(side=tk.LEFT, padx=(0, 5))
+        self.watch_remove_btn = tk.Button(editor, text="移除", command=self.remove_selected_watch_item)
+        self.watch_remove_btn.pack(side=tk.LEFT, padx=(0, 5))
+        self.watch_clear_btn = tk.Button(editor, text="清空", command=self.clear_watch_items)
+        self.watch_clear_btn.pack(side=tk.LEFT)
+
+        table_frame = tk.Frame(self.watch_panel)
+        table_frame.pack(fill=tk.X)
+
+        columns = ("enabled", "name", "address", "type", "period", "value", "status")
+        self.watch_tree_columns = columns
+        self.watch_tree = ttk.Treeview(
+            table_frame,
+            columns=columns,
+            show="headings",
+            height=5,
+        )
+        headings = {
+            "enabled": "启用",
+            "name": "名称",
+            "address": "地址",
+            "type": "类型",
+            "period": "周期",
+            "value": "当前值",
+            "status": "状态",
+        }
+        self.watch_tree_headings = headings
+        widths = {
+            "enabled": 46,
+            "name": 150,
+            "address": 100,
+            "type": 60,
+            "period": 60,
+            "value": 170,
+            "status": 180,
+        }
+        for col in columns:
+            self.watch_tree.heading(col, text=headings[col])
+            self.watch_tree.column(col, width=widths[col], anchor=tk.W)
+        self.watch_tree.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.watch_tree.bind("<<TreeviewSelect>>", self._on_watch_row_selected)
+        self.watch_tree.bind("<Double-1>", self._toggle_selected_watch_enabled)
+        self.watch_tree.bind("<Control-c>", self.copy_watch_selection)
+        self.watch_tree.bind("<Control-C>", self.copy_watch_selection)
+
+        scrollbar = ttk.Scrollbar(
+            table_frame,
+            orient=tk.VERTICAL,
+            command=self.watch_tree.yview,
+        )
+        scrollbar.pack(side=tk.LEFT, fill=tk.Y)
+        self.watch_tree.configure(yscrollcommand=scrollbar.set)
+
+        self.watch_status_var = tk.StringVar(value="未加载 AXF")
+        self.watch_status_label = tk.Label(self.watch_panel, textvariable=self.watch_status_var, anchor="w")
+        self.watch_status_label.pack(fill=tk.X, pady=(4, 0))
+
+        self.watch_popup_menu = tk.Menu(self.watch_tree, tearoff=0)
+        self.watch_popup_menu.add_command(label="复制", command=self.copy_watch_selection)
+        self.watch_tree.bind("<Button-3>", self.show_watch_popup)
+
+    def _restore_watch_items(self):
+        items = self.history.get("watch_items", [])
+        if items:
+            try:
+                self.core.replace_watch_items(items)
+                self._refresh_watch_table(self.core.list_watch_items())
+            except RTTError as e:
+                self.watch_status_var.set(f"恢复监控项失败: {e}")
+
+    def _set_watch_panel_visible(self, visible: bool, persist: bool = True):
+        self.watch_panel_visible = bool(visible)
+        if self.watch_panel_visible:
+            if not self.watch_panel.winfo_ismapped():
+                self.watch_panel.pack(fill=tk.X, before=self.mid_frame)
+            self.watch_toggle_btn.config(relief=tk.SUNKEN)
+        else:
+            self.watch_panel.pack_forget()
+            self.watch_toggle_btn.config(relief=tk.RAISED)
+        if persist:
+            self.save_history()
+
+    def toggle_watch_panel(self):
+        self._set_watch_panel_visible(not self.watch_panel_visible)
+        if self.watch_panel_visible:
+            self.focus_watch_editor()
+
+    def focus_watch_editor(self):
+        if not self.watch_panel_visible:
+            self._set_watch_panel_visible(True)
+        self.watch_name_combo.focus_set()
+
+    def load_axf_file(self):
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="加载 MDK/AC6 AXF",
+            filetypes=[
+                ("AXF/ELF files", "*.axf *.elf"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return None
+        try:
+            symbols = self.core.load_axf_variables(path)
+        except RTTError as e:
+            self.watch_status_var.set(str(e))
+            self.append_output(f"[变量] AXF 加载失败: {e}\n")
+            return None
+
+        self.watch_axf_path = path
+        self.watch_symbols = symbols
+        self.watch_symbol_by_name = {item["name"]: item for item in symbols}
+        names = [item["name"] for item in symbols]
+        self.watch_name_combo.config(values=names)
+        synced = self._sync_axf_watch_items()
+        sync_text = f"，同步 {synced} 个采样项" if synced else ""
+        self.watch_status_var.set(f"AXF: {path}，变量 {len(symbols)} 个{sync_text}")
+        self._set_watch_panel_visible(True)
+        self.save_history()
+        self.append_output(
+            f"[变量] 已加载 AXF: {path}，变量 {len(symbols)} 个{sync_text}。\n"
+        )
+        return symbols
+
+    def _sync_axf_watch_items(self) -> int:
+        items = self.core.list_watch_items(include_runtime=False)
+        changed = 0
+        for item in items:
+            if item.get("source") != "axf":
+                continue
+            symbol = self.watch_symbol_by_name.get(item.get("name", ""))
+            if not symbol:
+                continue
+            address = int(symbol.get("address", item.get("address", 0)))
+            value_type = symbol.get("type", item.get("type", "u32"))
+            if item.get("address") == address and item.get("type") == value_type:
+                continue
+            item["address"] = address
+            item["address_hex"] = symbol.get("address_hex", f"0x{address:08X}")
+            item["type"] = value_type
+            changed += 1
+        if changed:
+            self.core.replace_watch_items(items)
+            self._refresh_watch_table(self.core.list_watch_items())
+        return changed
+
+    def _on_watch_symbol_selected(self, event=None):
+        symbol = self.watch_symbol_by_name.get(self.watch_name_var.get())
+        if not symbol:
+            return
+        self.watch_addr_var.set(symbol.get("address_hex", f"0x{int(symbol['address']):08X}"))
+        self.watch_type_var.set(symbol.get("type", "u32"))
+
+    def _parse_watch_period(self) -> int:
+        try:
+            period = int(str(self.watch_period_var.get()).strip())
+        except ValueError as e:
+            raise RTTError("周期必须是整数毫秒") from e
+        if period < 50:
+            raise RTTError("周期最小 50ms")
+        return period
+
+    def add_watch_item(self):
+        name = self.watch_name_var.get().strip()
+        addr_text = self.watch_addr_var.get().strip()
+        symbol = self.watch_symbol_by_name.get(name)
+        if symbol and not addr_text:
+            addr_text = symbol.get("address_hex", str(symbol.get("address", "")))
+        if not name and addr_text:
+            name = addr_text
+        if not name or not addr_text:
+            self.watch_status_var.set("请填写变量名和地址，或先从 AXF 变量列表选择")
+            self.focus_watch_editor()
+            return None
+        try:
+            item = self.core.add_watch_item(
+                name=name,
+                address=int(addr_text, 0),
+                value_type=self.watch_type_var.get(),
+                period_ms=self._parse_watch_period(),
+                enabled=self.watch_enabled_var.get(),
+                source="axf" if symbol else "manual",
+            )
+        except (ValueError, RTTError) as e:
+            self.watch_status_var.set(str(e))
+            return None
+        self.watch_status_var.set(f"已添加: {item['name']}")
+        self.save_history()
+        return item
+
+    def remove_selected_watch_item(self):
+        selected = self.watch_tree.selection()
+        if not selected:
+            return
+        for item_id in selected:
+            self.core.remove_watch_item(item_id)
+        self.save_history()
+
+    def clear_watch_items(self):
+        self.core.clear_watch_items()
+        self.save_history()
+
+    def _on_watch_row_selected(self, event=None):
+        selected = self.watch_tree.selection()
+        if not selected:
+            return
+        item_id = selected[0]
+        item = self._watch_rows.get(item_id)
+        if not item:
+            return
+        self.watch_name_var.set(item.get("name", ""))
+        self.watch_addr_var.set(item.get("address_hex", ""))
+        self.watch_type_var.set(item.get("type", "u32"))
+        self.watch_period_var.set(str(item.get("period_ms", 500)))
+        self.watch_enabled_var.set(bool(item.get("enabled", True)))
+
+    def _toggle_selected_watch_enabled(self, event=None):
+        selected = self.watch_tree.selection()
+        if not selected:
+            return "break"
+        item_id = selected[0]
+        item = self._watch_rows.get(item_id)
+        if not item:
+            return "break"
+        self.core.set_watch_item_enabled(item_id, not bool(item.get("enabled", True)))
+        self.save_history()
+        return "break"
+
+    def show_watch_popup(self, event):
+        row_id = self.watch_tree.identify_row(event.y)
+        if row_id:
+            if row_id not in self.watch_tree.selection():
+                self.watch_tree.selection_set(row_id)
+            self.watch_tree.focus(row_id)
+        try:
+            self.watch_popup_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.watch_popup_menu.grab_release()
+
+    def copy_watch_selection(self, event=None):
+        selected = list(self.watch_tree.selection())
+        if not selected:
+            focused = self.watch_tree.focus()
+            if focused:
+                selected = [focused]
+        if not selected:
+            return "break"
+
+        header = "\t".join(
+            self.watch_tree_headings[col] for col in self.watch_tree_columns
+        )
+        rows = [header]
+        for item_id in selected:
+            values = self.watch_tree.item(item_id, "values")
+            rows.append("\t".join(str(value) for value in values))
+        text = "\n".join(rows)
+
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.watch_status_var.set(f"已复制 {len(selected)} 行")
+        except Exception:
+            pass
+        return "break" if event is not None else text
+
+    def toggle_memory_watch(self):
+        if self.core.memory_watch_running():
+            self.core.stop_memory_watch()
+            self.watch_run_btn.config(text="开始采样")
+            self.watch_status_var.set("采样已停止")
+            return
+        try:
+            self.core.start_memory_watch()
+        except RTTError as e:
+            self.watch_status_var.set(f"无法开始采样: {e}")
+            self.append_output(f"[变量] 无法开始采样: {e}\n")
+            return
+        self.watch_run_btn.config(text="停止采样")
+        self.watch_status_var.set("采样中")
+
+    def _refresh_watch_table(self, items, running: Optional[bool] = None):
+        self._watch_rows = {item["id"]: item for item in items}
+        existing = set(self.watch_tree.get_children())
+        incoming = set(self._watch_rows)
+        for item_id in existing - incoming:
+            self.watch_tree.delete(item_id)
+        for item_id, item in self._watch_rows.items():
+            status = item.get("error") or ("OK" if item.get("value") else "")
+            values = (
+                "是" if item.get("enabled") else "否",
+                item.get("name", ""),
+                item.get("address_hex", ""),
+                item.get("type", ""),
+                str(item.get("period_ms", "")),
+                item.get("value", ""),
+                status,
+            )
+            if item_id in existing:
+                self.watch_tree.item(item_id, values=values)
+            else:
+                self.watch_tree.insert("", tk.END, iid=item_id, values=values)
+        if running is not None:
+            self.watch_run_btn.config(text="停止采样" if running else "开始采样")
 
     @staticmethod
     def _validate_agent_port_chars(value):
@@ -592,11 +994,19 @@ class RTTViewerApp:
             self.append_output(payload.get("text", ""))
         elif event_type == EVENT_STATUS:
             self._refresh_connection_ui(payload.get("connected", False))
+            self._refresh_jlink_status(payload)
         elif event_type == EVENT_CONFIG:
             self._sync_config_from_core(payload)
+            if "connected" in payload or "jlink_status" in payload:
+                self._refresh_jlink_status(payload)
         elif event_type == EVENT_ERROR:
             # 错误已通过 output 事件输出到文本框，此处无需额外处理
             pass
+        elif event_type == EVENT_WATCH:
+            self._refresh_watch_table(
+                payload.get("items", []),
+                running=payload.get("running"),
+            )
 
     def _refresh_connection_ui(self, connected):
         if connected:
@@ -609,6 +1019,26 @@ class RTTViewerApp:
             self.device_combo.config(state="normal")
             self.iface_combo.config(state="readonly")
             self.charset_combo.config(state="readonly")
+
+    def _refresh_jlink_status(self, payload):
+        status = payload.get("jlink_status")
+        if not status:
+            status = "已连接" if payload.get("connected") else "未连接"
+        detail = str(payload.get("jlink_status_detail", "") or "")
+        text = f"J-Link: {status}"
+        if detail and detail not in {"J-Link connected", "disconnected", "not connected"}:
+            text = f"{text} ({detail})"
+        self.jlink_status_var.set(text)
+
+        colors = {
+            "已连接": "#1f7a1f",
+            "重连中": "#9a6500",
+            "异常": "#b00020",
+            "断开": "#b00020",
+            "连接失败": "#b00020",
+            "未连接": "#555555",
+        }
+        self.jlink_status_label.config(fg=colors.get(status, "#555555"))
 
     def _sync_config_from_core(self, cfg):
         """core 配置变更时同步 GUI 控件（避免触发循环，静默设置）。"""
@@ -675,6 +1105,9 @@ class RTTViewerApp:
             device=self.device_var.get(),
             devices=list(self.history.get("devices", [])),
             input_history=self.input_history,
+            watch_items=self.core.list_watch_items(include_runtime=False),
+            watch_axf_path=self.watch_axf_path,
+            watch_panel_visible=self.watch_panel_visible,
         )
         # 同步设备下拉列表
         self.device_combo['values'] = self.core.get_gui_devices()
@@ -813,6 +1246,7 @@ class RTTViewerApp:
             self.current_style = None
 
     def on_closing(self):
+        self.core.stop_memory_watch()
         self.stop_agent_server(persist_config=False, announce=False)
         try:
             self.core.unsubscribe(self._sub_id)

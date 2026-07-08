@@ -24,6 +24,8 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import pylink
 
+from cnrtt.watch import MemoryWatchManager, WatchError, load_axf_symbols
+
 # ── 配置文件路径 ──────────────────────────────────────────────
 CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".cnrtt")
 GUI_CONFIG_FILE = os.path.join(CONFIG_DIR, "rtt_history.json")
@@ -34,6 +36,12 @@ AGENT_HISTORY_FILE = os.path.join(CONFIG_DIR, "agent_history.json")
 DEFAULT_DEVICE = "STM32F407VE"
 DEFAULT_IFACE = "SWD"
 DEFAULT_CHARSET = "UTF-8"
+
+# J-Link 状态自检：低频检查，异常时自动重连
+DEFAULT_HEALTH_CHECK_INTERVAL = 10.0
+DEFAULT_HEALTH_RECONNECT_ATTEMPTS = 3
+DEFAULT_HEALTH_RECONNECT_DELAY = 0.5
+DEFAULT_HEALTH_OK_LOG_INTERVAL = 60.0
 
 # 环形缓冲容量（字符数）
 OUTPUT_BUFFER_SIZE = 64 * 1024
@@ -50,6 +58,7 @@ EVENT_OUTPUT = "output"      # text: str
 EVENT_STATUS = "status"      # connected: bool
 EVENT_CONFIG = "config"      # config: dict
 EVENT_ERROR = "error"        # message: str
+EVENT_WATCH = "watch"        # items: list
 
 
 class RTTCore:
@@ -66,8 +75,12 @@ class RTTCore:
         output_buffer_size: int = OUTPUT_BUFFER_SIZE,
         read_interval: float = 0.01,
         send_retries: int = 20,
+        health_check_interval: float = DEFAULT_HEALTH_CHECK_INTERVAL,
+        health_reconnect_attempts: int = DEFAULT_HEALTH_RECONNECT_ATTEMPTS,
     ) -> None:
         self._lock = threading.RLock()
+        self._jlink_io_lock = threading.RLock()
+        self._recovery_lock = threading.Lock()
         self._sub_lock = threading.Lock()
         self._subs: Dict[int, Callable[[str, Dict[str, Any]], None]] = {}
         self._next_sub_id = 1
@@ -77,6 +90,12 @@ class RTTCore:
         self._connected = False
         self._read_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
+        self._health_thread: Optional[threading.Thread] = None
+        self._health_stop_event = threading.Event()
+        self._jlink_status = "未连接"
+        self._jlink_status_detail = "未连接"
+        self._last_health_check = 0.0
+        self._last_health_ok_log = 0.0
 
         # 配置（运行期可变）
         self._device = DEFAULT_DEVICE
@@ -101,9 +120,19 @@ class RTTCore:
         # 读取/发送参数
         self._read_interval = read_interval
         self._send_retries = send_retries
+        self._health_check_interval = max(0.0, float(health_check_interval))
+        self._health_reconnect_attempts = max(0, int(health_reconnect_attempts))
+        self._health_reconnect_delay = DEFAULT_HEALTH_RECONNECT_DELAY
+        self._health_ok_log_interval = DEFAULT_HEALTH_OK_LOG_INTERVAL
 
         # agent 命令历史（由 agent_server 维护，core 提供存取）
         self._agent_history: List[str] = []
+
+        # 变量运行态监控（GUI 使用，agent JSON-RPC 暂不暴露）
+        self._watch_manager = MemoryWatchManager(
+            read_memory=self.read_memory,
+            on_update=self._emit_watch_update,
+        )
 
     # ── 事件总线 ──────────────────────────────────────────────
     def subscribe(self, callback: Callable[[str, Dict[str, Any]], None]) -> int:
@@ -129,6 +158,20 @@ class RTTCore:
                 # 订阅者出错不应阻断 core；GUI 侧的 marshal 错误也忽略
                 pass
 
+    def _status_payload(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "connected": self._connected,
+                "jlink_status": self._jlink_status,
+                "jlink_status_detail": self._jlink_status_detail,
+                "last_health_check": self._last_health_check,
+                "health_check_interval": self._health_check_interval,
+                "health_reconnect_attempts": self._health_reconnect_attempts,
+            }
+
+    def _emit_status(self) -> None:
+        self._emit(EVENT_STATUS, self._status_payload())
+
     # ── 连接 ──────────────────────────────────────────────────
     @property
     def is_connected(self) -> bool:
@@ -146,6 +189,7 @@ class RTTCore:
             if self._connected:
                 # 已连接则先断开，确保状态干净
                 try:
+                    self.stop_memory_watch()
                     self._disconnect_locked()
                 except Exception:
                     pass
@@ -157,7 +201,16 @@ class RTTCore:
             if charset:
                 self._charset = charset
 
-            try:
+            return self._connect_locked(announce=True, start_health=True)
+
+    def _connect_locked(
+        self,
+        announce: bool = True,
+        start_health: bool = True,
+    ) -> bool:
+        """建立 J-Link/RTT 会话。调用方已持有 _lock。"""
+        try:
+            with self._jlink_io_lock:
                 self._jlink = pylink.JLink()
                 self._jlink.open()
 
@@ -173,64 +226,259 @@ class RTTCore:
 
                 self._jlink.connect(self._device)
                 self._jlink.rtt_start()
-                time.sleep(0.2)
+            time.sleep(0.2)
 
-                self._connected = True
-                self._stop_event.clear()
-                self._read_thread = threading.Thread(
-                    target=self._read_loop, daemon=True
-                )
-                self._read_thread.start()
+            self._connected = True
+            self._stop_event.clear()
+            self._set_jlink_status("已连接", "J-Link connected")
+            self._read_thread = threading.Thread(
+                target=self._read_loop, daemon=True, name="cnrtt-rtt-read"
+            )
+            self._read_thread.start()
+            if start_health:
+                self._start_health_check_locked()
 
+            if announce:
                 self._emit_output("[系统] 连接成功，RTT 已启动。\n")
-                self._emit(EVENT_STATUS, {"connected": True})
-                self._emit(
-                    EVENT_CONFIG,
-                    {
-                        "device": self._device,
-                        "iface": self._iface,
-                        "charset": self._charset,
-                        "echo_send": self._echo_send,
-                        "hex_dump": self._hex_dump,
-                    },
-                )
-                return True
-            except Exception as e:
-                # 清理半开连接
-                if self._jlink:
-                    try:
-                        self._jlink.close()
-                    except Exception:
-                        pass
-                    self._jlink = None
-                self._connected = False
+            self._emit_status()
+            self._emit(
+                EVENT_CONFIG,
+                {
+                    "device": self._device,
+                    "iface": self._iface,
+                    "charset": self._charset,
+                    "echo_send": self._echo_send,
+                    "hex_dump": self._hex_dump,
+                },
+            )
+            return True
+        except Exception as e:
+            # 清理半开连接
+            if self._jlink:
+                try:
+                    self._jlink.close()
+                except Exception:
+                    pass
+                self._jlink = None
+            self._connected = False
+            self._set_jlink_status("连接失败", str(e))
+            self._emit_status()
+            if announce:
                 msg = f"[系统错误] {e}\n"
                 self._emit_output(msg)
                 self._emit(EVENT_ERROR, {"message": str(e)})
-                raise RTTError(str(e)) from e
+            raise RTTError(str(e)) from e
 
     def disconnect(self) -> None:
+        self.stop_memory_watch()
         with self._lock:
-            self._disconnect_locked()
+            self._disconnect_locked(stop_health=True)
         self._emit_output("[系统] 已断开连接。\n")
-        self._emit(EVENT_STATUS, {"connected": False})
+        self._emit_status()
 
-    def _disconnect_locked(self) -> None:
+    def _disconnect_locked(self, stop_health: bool = True) -> None:
         """断开（调用方已持锁）。"""
+        if stop_health:
+            self._stop_health_check_locked()
         self._connected = False
+        self._set_jlink_status("未连接", "disconnected")
         self._stop_event.set()
-        if self._read_thread and self._read_thread.is_alive():
+        if (
+            self._read_thread
+            and self._read_thread.is_alive()
+            and self._read_thread is not threading.current_thread()
+        ):
             self._read_thread.join(timeout=1.0)
         self._read_thread = None
 
-        if self._jlink:
+        with self._jlink_io_lock:
+            if self._jlink:
+                try:
+                    if self._jlink.connected():
+                        self._jlink.rtt_stop()
+                    self._jlink.close()
+                except Exception:
+                    pass
+                self._jlink = None
+
+    # ── J-Link 状态自检 / 自动恢复 ───────────────────────────
+    def _set_jlink_status(self, status: str, detail: str = "") -> None:
+        self._jlink_status = status
+        self._jlink_status_detail = detail
+        self._last_health_check = time.time()
+
+    def _start_health_check_locked(self) -> None:
+        if self._health_check_interval <= 0:
+            return
+        if self._health_thread and self._health_thread.is_alive():
+            return
+        self._health_stop_event.clear()
+        self._health_thread = threading.Thread(
+            target=self._health_loop,
+            daemon=True,
+            name="cnrtt-jlink-health",
+        )
+        self._health_thread.start()
+
+    def _stop_health_check_locked(self) -> None:
+        self._health_stop_event.set()
+        thread = self._health_thread
+        if (
+            thread
+            and thread.is_alive()
+            and thread is not threading.current_thread()
+        ):
+            thread.join(timeout=1.0)
+        if thread is not threading.current_thread():
+            self._health_thread = None
+
+    def _health_loop(self) -> None:
+        try:
+            while not self._health_stop_event.wait(self._health_check_interval):
+                self.check_jlink_status(recover=True)
+        finally:
+            with self._lock:
+                if self._health_thread is threading.current_thread():
+                    self._health_thread = None
+
+    def _probe_jlink_status(self) -> Tuple[bool, str]:
+        with self._jlink_io_lock:
+            if not self._connected or not self._jlink:
+                return False, "not connected"
             try:
-                if self._jlink.connected():
-                    self._jlink.rtt_stop()
-                self._jlink.close()
-            except Exception:
-                pass
-            self._jlink = None
+                if hasattr(self._jlink, "connected") and not self._jlink.connected():
+                    return False, "J-Link disconnected"
+                target_connected = getattr(self._jlink, "target_connected", None)
+                if callable(target_connected) and not target_connected():
+                    return False, "target disconnected"
+            except Exception as e:
+                return False, str(e)
+        return True, "J-Link connected"
+
+    def check_jlink_status(self, recover: bool = True) -> bool:
+        """低频 J-Link 自检。recover=True 时异常会同步尝试自动重连。"""
+        with self._lock:
+            has_session = self._connected or self._jlink is not None
+        if not has_session:
+            with self._lock:
+                self._set_jlink_status("未连接", "not connected")
+            self._emit_status()
+            return False
+
+        ok, detail = self._probe_jlink_status()
+        now = time.monotonic()
+        if ok:
+            with self._lock:
+                self._set_jlink_status("已连接", detail)
+                if now - self._last_health_ok_log >= self._health_ok_log_interval:
+                    self._last_health_ok_log = now
+            self._emit_status()
+            return True
+
+        with self._lock:
+            self._set_jlink_status("异常", detail)
+        self._emit_status()
+        if recover:
+            return self._recover_connection(detail)
+        self._emit(EVENT_ERROR, {"message": f"J-Link health check failed: {detail}"})
+        return False
+
+    def _schedule_recovery(self, reason: str) -> None:
+        if self._health_reconnect_attempts <= 0 or self._recovery_lock.locked():
+            return
+        t = threading.Thread(
+            target=self._recover_connection,
+            args=(reason,),
+            daemon=True,
+            name="cnrtt-jlink-recover",
+        )
+        t.start()
+
+    def _recover_connection(
+        self,
+        reason: str,
+        attempts: Optional[int] = None,
+    ) -> bool:
+        attempts = self._health_reconnect_attempts if attempts is None else attempts
+        if attempts <= 0:
+            return False
+        if not self._recovery_lock.acquire(blocking=False):
+            return False
+
+        try:
+            with self._lock:
+                has_session = self._connected or self._jlink is not None
+                device = self._device
+                iface = self._iface
+                charset = self._charset
+                watch_was_running = self.memory_watch_running()
+                self._connected = False
+                self._set_jlink_status("重连中", reason)
+            if not has_session:
+                return False
+
+            self._emit_status()
+
+            last_error: Optional[Exception] = None
+            for attempt in range(1, attempts + 1):
+                if self._health_stop_event.is_set():
+                    return False
+                try:
+                    with self._lock:
+                        self._set_jlink_status(
+                            "重连中",
+                            f"自动重连 {attempt}/{attempts}: {reason}",
+                        )
+                    self._emit_status()
+                    with self._lock:
+                        self.stop_memory_watch()
+                        self._disconnect_locked(stop_health=False)
+                        self._device = device
+                        self._iface = iface
+                        self._charset = charset
+                        self._connect_locked(announce=False, start_health=True)
+                    if watch_was_running:
+                        try:
+                            self.start_memory_watch()
+                        except RTTError as e:
+                            with self._lock:
+                                self._set_jlink_status(
+                                    "已连接",
+                                    f"自动重连成功，变量采样恢复失败: {e}",
+                                )
+                            self._emit_status()
+                            return True
+                    with self._lock:
+                        self._set_jlink_status("已连接", "自动重连成功")
+                    self._emit_status()
+                    return True
+                except Exception as e:
+                    last_error = e
+                    with self._lock:
+                        self._set_jlink_status(
+                            "重连中",
+                            f"自动重连 {attempt}/{attempts} 失败: {e}",
+                        )
+                    self._emit_status()
+                    if attempt < attempts:
+                        self._health_stop_event.wait(self._health_reconnect_delay)
+
+            with self._lock:
+                self.stop_memory_watch()
+                self._disconnect_locked(stop_health=False)
+                self._set_jlink_status(
+                    "断开",
+                    f"auto reconnect failed: {last_error}",
+                )
+                self._health_stop_event.set()
+            self._emit_status()
+            self._emit(
+                EVENT_ERROR,
+                {"message": f"auto reconnect failed: {last_error}"},
+            )
+            return False
+        finally:
+            self._recovery_lock.release()
 
     # ── 读取循环 ──────────────────────────────────────────────
     def _read_loop(self) -> None:
@@ -238,7 +486,10 @@ class RTTCore:
         charset = self._charset
         while not self._stop_event.is_set() and self._connected and self._jlink:
             try:
-                data = self._jlink.rtt_read(0, 1024)
+                with self._jlink_io_lock:
+                    if not self._connected or not self._jlink:
+                        break
+                    data = self._jlink.rtt_read(0, 1024)
                 if data:
                     byte_data = bytes(data)
                     if self._hex_dump:
@@ -247,11 +498,17 @@ class RTTCore:
                     text = byte_data.decode(charset, errors="replace")
                     self._emit_output(text)
             except Exception as e:
+                if self._stop_event.is_set():
+                    break
                 self._emit_output(f"[读取错误] {e}\n")
                 self._emit(EVENT_ERROR, {"message": f"read error: {e}"})
                 # 读取异常视为连接断开
                 self._connected = False
-                self._emit(EVENT_STATUS, {"connected": False})
+                with self._lock:
+                    self._set_jlink_status("异常", f"read error: {e}")
+                self.stop_memory_watch()
+                self._emit_status()
+                self._schedule_recovery(f"读取失败: {e}")
                 break
             self._stop_event.wait(self._read_interval)
 
@@ -278,17 +535,20 @@ class RTTCore:
             offset = 0
             retries = 0
             try:
-                while offset < total:
-                    written = self._jlink.rtt_write(0, data[offset:])
-                    offset += written
-                    if written == 0:
-                        if retries < self._send_retries:
-                            retries += 1
-                            time.sleep(0.01)
+                with self._jlink_io_lock:
+                    if not self._connected or not self._jlink:
+                        raise RTTError("not connected")
+                    while offset < total:
+                        written = self._jlink.rtt_write(0, data[offset:])
+                        offset += written
+                        if written == 0:
+                            if retries < self._send_retries:
+                                retries += 1
+                                time.sleep(0.01)
+                            else:
+                                break
                         else:
-                            break
-                    else:
-                        retries = 0
+                            retries = 0
 
                 # 回显
                 if self._echo_send:
@@ -299,10 +559,16 @@ class RTTCore:
                     else:
                         self._emit_output(f"[发送 {total}B] {text}\n")
                 return offset
+            except RTTError:
+                raise
             except Exception as e:
                 msg = f"[发送错误] {e}\n"
                 self._emit_output(msg)
                 self._emit(EVENT_ERROR, {"message": f"send error: {e}"})
+                with self._lock:
+                    self._set_jlink_status("异常", f"send error: {e}")
+                self._emit_status()
+                self._schedule_recovery(f"发送失败: {e}")
                 raise RTTError(f"send error: {e}") from e
 
     # ── 输出拉取 ──────────────────────────────────────────────
@@ -335,6 +601,81 @@ class RTTCore:
         if announce:
             self._emit_output("[系统] 输出已清空。\n")
 
+    # ── 运行态内存读取 / 变量监控 ─────────────────────────────
+    def read_memory(self, address: int, size: int) -> bytes:
+        """Read target memory without halting through the active J-Link session."""
+        if size <= 0:
+            raise RTTError("memory read size must be positive")
+        with self._jlink_io_lock:
+            if not self._connected or not self._jlink:
+                raise RTTError("not connected")
+            try:
+                data = self._jlink.memory_read8(int(address), int(size))
+            except Exception as e:
+                raise RTTError(f"memory read error: {e}") from e
+        return bytes(data)
+
+    def add_watch_item(
+        self,
+        name: str,
+        address: int,
+        value_type: str = "u32",
+        period_ms: int = 500,
+        enabled: bool = True,
+        source: str = "manual",
+    ) -> Dict[str, Any]:
+        try:
+            return self._watch_manager.add_item(
+                name=name,
+                address=address,
+                value_type=value_type,
+                period_ms=period_ms,
+                enabled=enabled,
+                source=source,
+            )
+        except WatchError as e:
+            raise RTTError(str(e)) from e
+
+    def replace_watch_items(self, items: List[Dict[str, Any]]) -> None:
+        try:
+            self._watch_manager.replace_items(items)
+        except WatchError as e:
+            raise RTTError(str(e)) from e
+
+    def remove_watch_item(self, item_id: str) -> None:
+        self._watch_manager.remove_item(item_id)
+
+    def clear_watch_items(self) -> None:
+        self._watch_manager.clear_items()
+
+    def set_watch_item_enabled(self, item_id: str, enabled: bool) -> None:
+        self._watch_manager.set_item_enabled(item_id, enabled)
+
+    def list_watch_items(self, include_runtime: bool = True) -> List[Dict[str, Any]]:
+        return self._watch_manager.list_items(include_runtime=include_runtime)
+
+    def start_memory_watch(self) -> bool:
+        if not self.is_connected:
+            raise RTTError("not connected")
+        return self._watch_manager.start()
+
+    def stop_memory_watch(self) -> None:
+        self._watch_manager.stop()
+
+    def memory_watch_running(self) -> bool:
+        return self._watch_manager.is_running
+
+    def load_axf_variables(self, path: str) -> List[Dict[str, Any]]:
+        try:
+            return load_axf_symbols(path)
+        except WatchError as e:
+            raise RTTError(str(e)) from e
+        except Exception as e:
+            raise RTTError(f"AXF 加载失败: {e}") from e
+
+    def _emit_watch_update(self, items: List[Dict[str, Any]]) -> None:
+        self._emit(EVENT_WATCH, {"items": items, "running": self.memory_watch_running()})
+
     # ── 配置 ──────────────────────────────────────────────────
     def get_config(self) -> Dict[str, Any]:
         with self._lock:
@@ -345,6 +686,11 @@ class RTTCore:
                 "echo_send": self._echo_send,
                 "hex_dump": self._hex_dump,
                 "connected": self._connected,
+                "jlink_status": self._jlink_status,
+                "jlink_status_detail": self._jlink_status_detail,
+                "last_health_check": self._last_health_check,
+                "health_check_interval": self._health_check_interval,
+                "health_reconnect_attempts": self._health_reconnect_attempts,
             }
 
     def set_config(self, **kwargs: Any) -> Dict[str, Any]:
@@ -389,6 +735,9 @@ class RTTCore:
         device: Optional[str] = None,
         devices: Optional[List[str]] = None,
         input_history: Optional[List[str]] = None,
+        watch_items: Optional[List[Dict[str, Any]]] = None,
+        watch_axf_path: Optional[str] = None,
+        watch_panel_visible: Optional[bool] = None,
     ) -> None:
         """保存 GUI 侧配置。device/devices/input_history 由 GUI 提供。"""
         with self._lock:
@@ -407,6 +756,12 @@ class RTTCore:
                 self._gui_history["devices"] = devices
             if input_history is not None:
                 self._gui_history["input_history"] = input_history
+            if watch_items is not None:
+                self._gui_history["watch_items"] = watch_items
+            if watch_axf_path is not None:
+                self._gui_history["watch_axf_path"] = watch_axf_path
+            if watch_panel_visible is not None:
+                self._gui_history["watch_panel_visible"] = bool(watch_panel_visible)
             data = dict(self._gui_history)
         try:
             os.makedirs(CONFIG_DIR, exist_ok=True)
@@ -480,6 +835,7 @@ class RTTCore:
     def close(self) -> None:
         """彻底关闭：断开连接 + 清空订阅者。"""
         try:
+            self.stop_memory_watch()
             self.disconnect()
         except Exception:
             pass

@@ -10,7 +10,14 @@ from unittest import mock
 import pytest
 
 from cnrtt import core as core_mod
-from cnrtt.core import RTTCore, RTTError, EVENT_OUTPUT, EVENT_STATUS, EVENT_CONFIG
+from cnrtt.core import (
+    EVENT_CONFIG,
+    EVENT_OUTPUT,
+    EVENT_STATUS,
+    EVENT_WATCH,
+    RTTCore,
+    RTTError,
+)
 
 
 @pytest.fixture
@@ -33,6 +40,8 @@ def fake_jlink():
     jlink.rtt_read.return_value = []
     # rtt_write 返回写入字节数
     jlink.rtt_write.side_effect = lambda channel, data: len(data)
+    jlink.memory_read8.return_value = [0x78, 0x56, 0x34, 0x12]
+    jlink.target_connected.return_value = True
     return jlink
 
 
@@ -189,7 +198,10 @@ def test_connect_emits_status_and_output(core, fake_jlink):
     types = [e[0] for e in events]
     assert EVENT_OUTPUT in types   # "连接成功" 提示
     assert EVENT_STATUS in types
-    assert ("status", {"connected": True}) in events
+    assert any(
+        t == EVENT_STATUS and p.get("connected") is True
+        for t, p in events
+    )
     assert core.is_connected is True
 
 
@@ -217,6 +229,88 @@ def test_send_echo(core, fake_jlink):
     core.send("ping")
     outs = [p["text"] for t, p in received if t == EVENT_OUTPUT]
     assert any("发送" in o for o in outs)
+
+
+def test_send_error_triggers_recovery(core, fake_jlink):
+    _patched_connect(core, fake_jlink)
+    fake_jlink.rtt_write.side_effect = RuntimeError("Unspecified error")
+    try:
+        with mock.patch.object(core, "_schedule_recovery") as schedule_recovery:
+            with pytest.raises(RTTError):
+                core.send("ping")
+        schedule_recovery.assert_called_once()
+        cfg = core.get_config()
+        assert cfg["jlink_status"] == "异常"
+        lines, _ = core.get_output()
+        assert "[发送错误] Unspecified error" in "".join(lines)
+    finally:
+        core.disconnect()
+
+
+def test_health_check_recovers_disconnected_jlink(tmp_config_dir, fake_jlink):
+    core = RTTCore(read_interval=0.005, health_check_interval=0)
+    new_jlink = mock.MagicMock()
+    new_jlink.connected.return_value = True
+    new_jlink.target_connected.return_value = True
+    new_jlink.rtt_read.return_value = []
+    new_jlink.rtt_write.side_effect = lambda channel, data: len(data)
+    new_jlink.memory_read8.return_value = [0x78, 0x56, 0x34, 0x12]
+
+    with mock.patch.object(core_mod, "pylink") as pl:
+        pl.JLink.return_value = fake_jlink
+        pl.enums.JLinkInterfaces.SWD = "SWD"
+        pl.enums.JLinkInterfaces.JTAG = "JTAG"
+        core.connect(device="STM32F407VE")
+
+    fake_jlink.connected.return_value = False
+    try:
+        with mock.patch.object(core_mod, "pylink") as pl:
+            pl.JLink.return_value = new_jlink
+            pl.enums.JLinkInterfaces.SWD = "SWD"
+            pl.enums.JLinkInterfaces.JTAG = "JTAG"
+            assert core.check_jlink_status(recover=True) is True
+
+        assert core.is_connected is True
+        fake_jlink.close.assert_called()
+        new_jlink.open.assert_called_once()
+        new_jlink.connect.assert_called_with("STM32F407VE")
+        cfg = core.get_config()
+        assert cfg["jlink_status"] == "已连接"
+        assert cfg["jlink_status_detail"] == "自动重连成功"
+        lines, _ = core.get_output()
+        joined = "".join(lines)
+        assert "[自检]" not in joined
+    finally:
+        core.disconnect()
+
+
+def test_memory_read_uses_active_jlink(core, fake_jlink):
+    _patched_connect(core, fake_jlink)
+    data = core.read_memory(0x20000000, 4)
+    assert data == bytes([0x78, 0x56, 0x34, 0x12])
+    fake_jlink.memory_read8.assert_called_with(0x20000000, 4)
+
+
+def test_memory_watch_emits_updates(core, fake_jlink):
+    events = []
+    core.subscribe(lambda t, p: events.append((t, p)))
+    _patched_connect(core, fake_jlink)
+    core.add_watch_item("counter", 0x20000000, "u32", period_ms=50)
+    core.start_memory_watch()
+    try:
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            watch_events = [p for t, p in events if t == EVENT_WATCH]
+            if watch_events and watch_events[-1]["items"][0].get("value"):
+                break
+            time.sleep(0.02)
+    finally:
+        core.stop_memory_watch()
+        core.disconnect()
+
+    watch_events = [p for t, p in events if t == EVENT_WATCH]
+    assert watch_events
+    assert watch_events[-1]["items"][0]["value"] == "305419896 (0x12345678)"
 
 
 def test_disconnect(core, fake_jlink):

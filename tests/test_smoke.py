@@ -50,6 +50,46 @@ def test_gui_components():
         assert hasattr(app, "hex_dump_var")
         assert app.hex_dump_var.get() is False
 
+        # J-Link 状态标签
+        assert hasattr(app, "jlink_status_var")
+        assert "J-Link" in app.jlink_status_var.get()
+        app._refresh_jlink_status(
+            {
+                "connected": False,
+                "jlink_status": "重连中",
+                "jlink_status_detail": "自动重连 1/3",
+            }
+        )
+        assert "重连中" in app.jlink_status_var.get()
+        assert "自动重连 1/3" in app.jlink_status_var.get()
+
+        # 变量监控控件
+        assert hasattr(app, "watch_toggle_btn")
+        assert hasattr(app, "load_axf_btn")
+        assert hasattr(app, "watch_run_btn")
+        assert hasattr(app, "watch_tree")
+        assert app.watch_run_btn.cget("text") == "开始采样"
+
+        app._refresh_watch_table(
+            [
+                {
+                    "id": "w1",
+                    "enabled": True,
+                    "name": "counter",
+                    "address_hex": "0x20000000",
+                    "type": "u32",
+                    "period_ms": 250,
+                    "value": "1 (0x00000001)",
+                    "error": "",
+                }
+            ]
+        )
+        app.watch_tree.selection_set("w1")
+        copied = app.copy_watch_selection()
+        assert "名称" in copied
+        assert "counter" in copied
+        assert "1 (0x00000001)" in copied
+
         # 清屏方法
         assert hasattr(app, "clear_output")
         assert callable(app.clear_output)
@@ -58,6 +98,9 @@ def test_gui_components():
         assert hasattr(app, "pause_scroll_btn")
         assert app.pause_scroll_btn.cget("text") == "暂停滚动"
         assert app.output_scroll_paused is False
+        assert hasattr(app, "bottom_frame")
+        assert app.bottom_frame.pack_info()["side"] == "bottom"
+        assert int(app.output_text.cget("height")) == 8
 
         app.toggle_output_scroll()
         assert app.output_scroll_paused is True
@@ -78,6 +121,77 @@ def test_gui_components():
         assert hasattr(app, "agent_toggle")
         assert app.agent_port_var.get() == "7000"
         assert "未监听" in app.agent_status_var.get()
+    finally:
+        root.destroy()
+
+
+def test_manual_watch_item_adds_via_core():
+    """GUI 手动添加变量应调用 core 的 watch API。"""
+    root = tk.Tk()
+    try:
+        with mock.patch.object(RTTViewerApp, 'load_history', return_value={"last_device": "STM32F407VE", "devices": ["STM32F407VE"]}):
+            with mock.patch.object(RTTCore, "load_agent_config", return_value={}):
+                app = RTTViewerApp(root)
+
+        with mock.patch.object(app, "save_history"):
+            with mock.patch.object(
+                app.core,
+                "add_watch_item",
+                return_value={"id": "w1", "name": "counter"},
+            ) as add_watch_item:
+                app.watch_name_var.set("counter")
+                app.watch_addr_var.set("0x20000000")
+                app.watch_type_var.set("u32")
+                app.watch_period_var.set("250")
+
+                assert app.add_watch_item()["name"] == "counter"
+
+        add_watch_item.assert_called_once_with(
+            name="counter",
+            address=0x20000000,
+            value_type="u32",
+            period_ms=250,
+            enabled=True,
+            source="manual",
+        )
+    finally:
+        root.destroy()
+
+
+def test_axf_load_syncs_existing_axf_watch_items():
+    """重新加载 AXF 后，应刷新已有 AXF 来源采样项的地址。"""
+    root = tk.Tk()
+    try:
+        with mock.patch.object(RTTViewerApp, 'load_history', return_value={"last_device": "STM32F407VE", "devices": ["STM32F407VE"]}):
+            with mock.patch.object(RTTCore, "load_agent_config", return_value={}):
+                app = RTTViewerApp(root)
+
+        app.core.replace_watch_items(
+            [
+                {
+                    "id": "w1",
+                    "name": "uwTick",
+                    "address": 4,
+                    "type": "u32",
+                    "period_ms": 500,
+                    "enabled": True,
+                    "source": "axf",
+                }
+            ]
+        )
+        app.watch_symbol_by_name = {
+            "uwTick": {
+                "name": "uwTick",
+                "address": 0x20000000,
+                "address_hex": "0x20000000",
+                "type": "u32",
+            }
+        }
+
+        assert app._sync_axf_watch_items() == 1
+        items = app.core.list_watch_items(include_runtime=False)
+        assert items[0]["address"] == 0x20000000
+        assert items[0]["address_hex"] == "0x20000000"
     finally:
         root.destroy()
 
