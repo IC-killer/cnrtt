@@ -371,6 +371,16 @@ class _ClientHandler:
             self.core.append_agent_history("reset")
             self.core.save_agent_history()
             return {"ok": True}
+        if method in {"halt", "pause"}:
+            self.core.halt_target()
+            self.core.append_agent_history("halt")
+            self.core.save_agent_history()
+            return {"ok": True}
+        if method == "run":
+            self.core.run_target()
+            self.core.append_agent_history("run")
+            self.core.save_agent_history()
+            return {"ok": True}
         if method == "send":
             text = params.get("text")
             if text is None or not isinstance(text, str):
@@ -408,6 +418,7 @@ class _ClientHandler:
                 ),
                 "running": self.core.memory_watch_running(),
                 "stats": self.core.get_memory_watch_stats(),
+                "budget": self.core.get_memory_watch_budget(),
             }
         if method == "watch_add":
             if "name" not in params or "address" not in params:
@@ -446,6 +457,27 @@ class _ClientHandler:
             return {"running": False}
         if method == "watch_stats":
             return self.core.get_memory_watch_stats()
+        if method == "watch_budget_get":
+            return self.core.get_memory_watch_budget()
+        if method == "watch_budget_set":
+            budget_params = {
+                "max_read_calls_per_cycle": params.get(
+                    "max_read_calls_per_cycle",
+                    params.get("max_calls"),
+                ),
+                "max_bytes_per_cycle": params.get(
+                    "max_bytes_per_cycle",
+                    params.get("max_bytes"),
+                ),
+                "max_cycle_ms": params.get("max_cycle_ms"),
+                "merge_gap": params.get("merge_gap"),
+            }
+            budget_params = {
+                key: value for key, value in budget_params.items() if value is not None
+            }
+            if not budget_params:
+                raise _RpcError(ERR_INVALID_PARAMS, "budget parameter required")
+            return self.core.set_memory_watch_budget(**budget_params)
         if method == "get_config":
             return self.core.get_config()
         if method == "set_config":

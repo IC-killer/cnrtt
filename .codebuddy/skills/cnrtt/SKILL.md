@@ -12,8 +12,10 @@ cnrtt is a Python/Tkinter RTT (Real-Time Transfer) client for SEGGER J-Link debu
 Use this skill to:
 - Check whether the cnrtt agent server is listening.
 - Connect/disconnect a J-Link target.
+- Reset, halt, or resume the target through J-Link.
 - Read RTT output and watch live logs.
 - Send target commands through RTT channel 0.
+- Read target memory and manage runtime variable watch items.
 - Discover target commands with the default `k:help` command.
 
 ## Prerequisites
@@ -96,7 +98,15 @@ c.call("send", {"text": "k:help", "append_newline": True})
 
 Use `k:help` as the default first command to discover target-side commands.
 
-### 4. Read RTT Output
+### 4. Control Target State
+
+```python
+c.call("reset")  # J-Link reset
+c.call("halt")   # J-Link halt / pause
+c.call("run")    # J-Link go / resume
+```
+
+### 5. Read RTT Output
 
 To read output from the MCU:
 
@@ -109,7 +119,7 @@ result = c.call("get_output", {"limit": 100})
 result = c.call("get_output", {"since": last_cursor, "limit": 1000})
 ```
 
-### 5. Monitor Output in Real-Time
+### 6. Monitor Output in Real-Time
 
 To continuously monitor RTT output (run in separate thread/client):
 
@@ -132,7 +142,37 @@ c_watch.close()
 
 **Important**: Use separate `AgentClient` instances for `call()` and `watch()` - they cannot share the same socket.
 
-### 6. Disconnect
+### 7. Read Memory and Watch Variables
+
+```python
+# One-shot online memory read
+c.call("read_memory", {"address": "0x20000000", "size": 4})
+
+# Periodic variable watch
+c.call("watch_add", {
+    "name": "counter",
+    "address": "0x20000000",
+    "type": "u32",
+    "period_ms": 250,
+})
+c.call("watch_budget_get")
+c.call("watch_start")
+items = c.call("watch_list")["items"]
+c.call("watch_stop")
+```
+
+Use `watch_budget_set` to limit sampling pressure:
+
+```python
+c.call("watch_budget_set", {
+    "max_calls": 32,
+    "max_bytes": "0x2000",
+    "max_cycle_ms": 10,
+    "merge_gap": 16,
+})
+```
+
+### 8. Disconnect
 
 ```python
 c.call("disconnect")
@@ -149,7 +189,8 @@ c.call("disconnect")
 3. Send default target discovery command: k:help
 4. Read the response via get_output() and identify available commands
 5. Send test commands and verify responses
-6. Disconnect when done
+6. Use reset/halt/run or memory watch when target state inspection is needed
+7. Disconnect when done
 ```
 
 ### Real-Time Log Monitoring

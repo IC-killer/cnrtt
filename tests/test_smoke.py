@@ -63,14 +63,28 @@ def test_gui_components():
         assert "重连中" in app.jlink_status_var.get()
         assert "自动重连 1/3" in app.jlink_status_var.get()
         assert hasattr(app, "reset_btn")
+        assert hasattr(app, "pause_btn")
+        assert hasattr(app, "run_btn")
         assert app.reset_btn.cget("state") == tk.DISABLED
+        assert app.pause_btn.cget("state") == tk.DISABLED
+        assert app.run_btn.cget("state") == tk.DISABLED
         app._refresh_connection_ui(True)
         assert app.reset_btn.cget("state") == tk.NORMAL
+        assert app.pause_btn.cget("state") == tk.NORMAL
+        assert app.run_btn.cget("state") == tk.NORMAL
         with mock.patch.object(app.core, "reset_target", return_value=True) as reset:
             app.reset_target()
         reset.assert_called_once()
+        with mock.patch.object(app.core, "halt_target", return_value=True) as halt:
+            app.pause_target()
+        halt.assert_called_once()
+        with mock.patch.object(app.core, "run_target", return_value=True) as run:
+            app.run_target()
+        run.assert_called_once()
         app._refresh_connection_ui(False)
         assert app.reset_btn.cget("state") == tk.DISABLED
+        assert app.pause_btn.cget("state") == tk.DISABLED
+        assert app.run_btn.cget("state") == tk.DISABLED
 
         # 变量监控控件
         assert hasattr(app, "watch_toggle_btn")
@@ -219,6 +233,60 @@ def test_axf_symbol_search_result_view_adds_selected_symbols():
         app.show_watch_table()
         assert app.watch_return_btn.cget("state") == tk.DISABLED
         assert app.watch_search_mode is False
+    finally:
+        root.destroy()
+
+
+def test_watch_budget_controls_apply_and_reset():
+    root = tk.Tk()
+    try:
+        history = {
+            "last_device": "STM32F407VE",
+            "devices": ["STM32F407VE"],
+            "watch_budget": {
+                "max_read_calls_per_cycle": 4,
+                "max_bytes_per_cycle": 128,
+                "max_cycle_ms": 7.5,
+                "merge_gap": 2,
+            },
+        }
+        with mock.patch.object(RTTViewerApp, 'load_history', return_value=history):
+            with mock.patch.object(RTTCore, "load_agent_config", return_value={}):
+                app = RTTViewerApp(root)
+
+        assert app.core.get_memory_watch_budget() == history["watch_budget"]
+        assert app.watch_max_calls_var.get() == "4"
+        assert app.watch_max_bytes_var.get() == "128"
+        assert app.watch_max_cycle_ms_var.get() == "7.5"
+        assert app.watch_merge_gap_var.get() == "2"
+
+        app.watch_max_calls_var.set("8")
+        app.watch_max_bytes_var.set("0x200")
+        app.watch_max_cycle_ms_var.set("0")
+        app.watch_merge_gap_var.set("16")
+        with mock.patch.object(app, "save_history") as save_history:
+            budget = app.apply_watch_budget()
+
+        assert budget == {
+            "max_read_calls_per_cycle": 8,
+            "max_bytes_per_cycle": 512,
+            "max_cycle_ms": 0.0,
+            "merge_gap": 16,
+        }
+        assert app.watch_max_bytes_var.get() == "512"
+        assert "采样预算已应用" in app.watch_status_var.get()
+        save_history.assert_called_once()
+
+        with mock.patch.object(app, "save_history") as save_history:
+            default_budget = app.reset_watch_budget()
+
+        assert default_budget["max_read_calls_per_cycle"] == 64
+        assert default_budget["max_bytes_per_cycle"] == 16 * 1024
+        assert default_budget["max_cycle_ms"] == 25.0
+        assert default_budget["merge_gap"] == 16
+        assert app.watch_max_calls_var.get() == "64"
+        assert app.watch_max_cycle_ms_var.get() == "25"
+        save_history.assert_called_once()
     finally:
         root.destroy()
 

@@ -235,13 +235,26 @@ def test_reset_target_uses_active_jlink(core, fake_jlink):
     with pytest.raises(RTTError) as not_connected:
         core.reset_target()
     assert not_connected.value.kind == "not_connected"
+    with pytest.raises(RTTError) as not_connected:
+        core.halt_target()
+    assert not_connected.value.kind == "not_connected"
+    with pytest.raises(RTTError) as not_connected:
+        core.run_target()
+    assert not_connected.value.kind == "not_connected"
 
     _patched_connect(core, fake_jlink)
     try:
         assert core.reset_target() is True
         fake_jlink.reset.assert_called_once()
+        assert core.halt_target() is True
+        fake_jlink.halt.assert_called_once()
+        assert core.run_target() is True
+        fake_jlink.go.assert_called_once()
         lines, _ = core.get_output()
-        assert "复位目标" in "".join(lines)
+        joined = "".join(lines)
+        assert "复位目标" in joined
+        assert "暂停目标" in joined
+        assert "运行目标" in joined
     finally:
         core.disconnect()
 
@@ -359,6 +372,41 @@ def test_memory_read_connection_loss_marks_status_and_schedules_recovery(core, f
         assert cfg["last_memory_read_error_kind"] == "connection_lost"
     finally:
         core.disconnect()
+
+
+def test_memory_watch_budget_config_and_persistence(tmp_config_dir, core):
+    events = []
+    core.subscribe(lambda t, p: events.append((t, p)))
+
+    budget = core.set_memory_watch_budget(
+        max_read_calls_per_cycle="3",
+        max_bytes_per_cycle="0x40",
+        max_cycle_ms="10.5",
+        merge_gap="8",
+    )
+
+    assert budget == {
+        "max_read_calls_per_cycle": 3,
+        "max_bytes_per_cycle": 64,
+        "max_cycle_ms": 10.5,
+        "merge_gap": 8,
+    }
+    assert core.get_config()["memory_watch_budget"] == budget
+    assert any(
+        event_type == EVENT_CONFIG
+        and payload.get("memory_watch_budget") == budget
+        for event_type, payload in events
+    )
+
+    core.save_gui_config(watch_budget=budget)
+    core2 = RTTCore()
+    data = core2.load_gui_config()
+    assert data["watch_budget"] == budget
+    assert core2.get_memory_watch_budget() == budget
+
+    with pytest.raises(RTTError) as err:
+        core.set_memory_watch_budget(max_read_calls_per_cycle=0)
+    assert err.value.kind == "invalid_params"
 
 
 def test_memory_watch_emits_updates(core, fake_jlink):

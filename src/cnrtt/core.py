@@ -588,22 +588,66 @@ class RTTCore:
 
     def reset_target(self) -> bool:
         """Reset target MCU through the active J-Link session."""
+        return self._target_control(
+            method_names=("reset",),
+            success_text="[系统] 已通过 J-Link 复位目标。\n",
+            error_prefix="reset",
+            recovery_text="复位失败",
+        )
+
+    def halt_target(self) -> bool:
+        """Halt target MCU through the active J-Link session."""
+        return self._target_control(
+            method_names=("halt",),
+            success_text="[系统] 已通过 J-Link 暂停目标。\n",
+            error_prefix="halt",
+            recovery_text="暂停失败",
+        )
+
+    def run_target(self) -> bool:
+        """Resume target MCU through the active J-Link session."""
+        return self._target_control(
+            method_names=("go", "restart"),
+            success_text="[系统] 已通过 J-Link 运行目标。\n",
+            error_prefix="run",
+            recovery_text="运行失败",
+        )
+
+    def _target_control(
+        self,
+        method_names: Tuple[str, ...],
+        success_text: str,
+        error_prefix: str,
+        recovery_text: str,
+    ) -> bool:
         try:
             with self._jlink_io_lock:
                 if not self._connected or not self._jlink:
                     raise RTTError("not connected", kind="not_connected")
-                self._jlink.reset()
-            self._emit_output("[系统] 已通过 J-Link 复位目标。\n")
+                command = None
+                for method_name in method_names:
+                    candidate = getattr(self._jlink, method_name, None)
+                    if callable(candidate):
+                        command = candidate
+                        break
+                if command is None:
+                    joined = "/".join(method_names)
+                    raise RTTError(
+                        f"J-Link command unavailable: {joined}",
+                        kind="jlink_error",
+                    )
+                command()
+            self._emit_output(success_text)
             return True
         except RTTError:
             raise
         except Exception as e:
-            msg = f"reset error: {e}"
+            msg = f"{error_prefix} error: {e}"
             self._emit(EVENT_ERROR, {"message": msg})
             with self._lock:
                 self._set_jlink_status("异常", msg)
             self._emit_status()
-            self._schedule_recovery(f"复位失败: {e}")
+            self._schedule_recovery(f"{recovery_text}: {e}")
             raise RTTError(msg) from e
 
     # ── 输出拉取 ──────────────────────────────────────────────
@@ -792,6 +836,28 @@ class RTTCore:
     def get_memory_watch_stats(self) -> Dict[str, Any]:
         return self._watch_manager.get_stats()
 
+    def get_memory_watch_budget(self) -> Dict[str, Any]:
+        return self._watch_manager.get_budget()
+
+    def set_memory_watch_budget(
+        self,
+        max_read_calls_per_cycle: Optional[Any] = None,
+        max_bytes_per_cycle: Optional[Any] = None,
+        max_cycle_ms: Optional[Any] = None,
+        merge_gap: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        try:
+            budget = self._watch_manager.set_budget(
+                max_read_calls_per_cycle=max_read_calls_per_cycle,
+                max_bytes_per_cycle=max_bytes_per_cycle,
+                max_cycle_ms=max_cycle_ms,
+                merge_gap=merge_gap,
+            )
+        except WatchError as e:
+            raise RTTError(str(e), kind="invalid_params") from e
+        self._emit(EVENT_CONFIG, {"memory_watch_budget": budget})
+        return budget
+
     def start_memory_watch(self) -> bool:
         if not self.is_connected:
             raise RTTError("not connected", kind="not_connected")
@@ -843,6 +909,7 @@ class RTTCore:
                 "last_memory_read_latency_ms": self._last_memory_read_latency_ms,
                 "last_memory_read_error": self._last_memory_read_error,
                 "last_memory_read_error_kind": self._last_memory_read_error_kind,
+                "memory_watch_budget": self.get_memory_watch_budget(),
             }
 
     def set_config(self, **kwargs: Any) -> Dict[str, Any]:
@@ -877,6 +944,11 @@ class RTTCore:
                         self._echo_send = data["echo_send"]
                     if data.get("hex_dump") is not None:
                         self._hex_dump = data["hex_dump"]
+                    if isinstance(data.get("watch_budget"), dict):
+                        try:
+                            self._watch_manager.set_budget(**data["watch_budget"])
+                        except WatchError:
+                            pass
                     return data
             except Exception:
                 pass
@@ -890,6 +962,7 @@ class RTTCore:
         watch_items: Optional[List[Dict[str, Any]]] = None,
         watch_axf_path: Optional[str] = None,
         watch_panel_visible: Optional[bool] = None,
+        watch_budget: Optional[Dict[str, Any]] = None,
     ) -> None:
         """保存 GUI 侧配置。device/devices/input_history 由 GUI 提供。"""
         with self._lock:
@@ -914,6 +987,8 @@ class RTTCore:
                 self._gui_history["watch_axf_path"] = watch_axf_path
             if watch_panel_visible is not None:
                 self._gui_history["watch_panel_visible"] = bool(watch_panel_visible)
+            if watch_budget is not None:
+                self._gui_history["watch_budget"] = dict(watch_budget)
             data = dict(self._gui_history)
         try:
             os.makedirs(CONFIG_DIR, exist_ok=True)

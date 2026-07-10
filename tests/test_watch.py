@@ -3,8 +3,11 @@
 import time
 import struct
 
+import pytest
+
 from cnrtt.watch import (
     MemoryWatchManager,
+    WatchError,
     _add_dwarf_watch_symbols,
     _load_elf_symtab_symbols_raw,
     _location_to_address,
@@ -350,6 +353,31 @@ def test_memory_watch_manager_applies_read_call_budget():
     assert items["a"]["read_count"] == 1
     assert items["b"]["read_count"] == 0
     assert items["c"]["read_count"] == 0
+
+
+def test_memory_watch_manager_budget_can_be_reconfigured():
+    mgr = MemoryWatchManager(
+        read_memory=lambda address, size: bytes(size),
+        on_update=lambda items: None,
+    )
+
+    budget = mgr.set_budget(
+        max_read_calls_per_cycle="0x2",
+        max_bytes_per_cycle="0x20",
+        max_cycle_ms="0",
+        merge_gap="4",
+    )
+
+    assert budget == {
+        "max_read_calls_per_cycle": 2,
+        "max_bytes_per_cycle": 32,
+        "max_cycle_ms": 0.0,
+        "merge_gap": 4,
+    }
+    assert mgr.get_stats()["budget"] == budget
+
+    with pytest.raises(WatchError):
+        mgr.set_budget(max_bytes_per_cycle=0)
 
 
 def test_load_axf_symbols_from_minimal_elf_symtab(tmp_path):

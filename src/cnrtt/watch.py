@@ -238,10 +238,19 @@ class MemoryWatchManager:
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._running = False
-        self._max_read_calls_per_cycle = max(1, int(max_read_calls_per_cycle or 1))
-        self._max_bytes_per_cycle = max(1, int(max_bytes_per_cycle or 1))
-        self._max_cycle_ms = max(0.0, float(max_cycle_ms or 0.0))
-        self._merge_gap = max(0, int(merge_gap or 0))
+        self._max_read_calls_per_cycle = self._parse_positive_int(
+            max_read_calls_per_cycle,
+            "每轮最大读次数",
+        )
+        self._max_bytes_per_cycle = self._parse_positive_int(
+            max_bytes_per_cycle,
+            "每轮最大字节数",
+        )
+        self._max_cycle_ms = self._parse_non_negative_float(
+            max_cycle_ms,
+            "每轮最大耗时",
+        )
+        self._merge_gap = self._parse_non_negative_int(merge_gap, "合并间隙")
         self._stats: Dict[str, Any] = self._empty_stats()
 
     @property
@@ -251,7 +260,84 @@ class MemoryWatchManager:
 
     def get_stats(self) -> Dict[str, Any]:
         with self._lock:
-            return dict(self._stats)
+            stats = dict(self._stats)
+            stats["budget"] = self._budget_locked()
+            return stats
+
+    def get_budget(self) -> Dict[str, Any]:
+        with self._lock:
+            return self._budget_locked()
+
+    def set_budget(
+        self,
+        max_read_calls_per_cycle: Optional[Any] = None,
+        max_bytes_per_cycle: Optional[Any] = None,
+        max_cycle_ms: Optional[Any] = None,
+        merge_gap: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        with self._lock:
+            if max_read_calls_per_cycle is not None:
+                self._max_read_calls_per_cycle = self._parse_positive_int(
+                    max_read_calls_per_cycle,
+                    "每轮最大读次数",
+                )
+            if max_bytes_per_cycle is not None:
+                self._max_bytes_per_cycle = self._parse_positive_int(
+                    max_bytes_per_cycle,
+                    "每轮最大字节数",
+                )
+            if max_cycle_ms is not None:
+                self._max_cycle_ms = self._parse_non_negative_float(
+                    max_cycle_ms,
+                    "每轮最大耗时",
+                )
+            if merge_gap is not None:
+                self._merge_gap = self._parse_non_negative_int(
+                    merge_gap,
+                    "合并间隙",
+                )
+            return self._budget_locked()
+
+    def _budget_locked(self) -> Dict[str, Any]:
+        return {
+            "max_read_calls_per_cycle": self._max_read_calls_per_cycle,
+            "max_bytes_per_cycle": self._max_bytes_per_cycle,
+            "max_cycle_ms": self._max_cycle_ms,
+            "merge_gap": self._merge_gap,
+        }
+
+    @staticmethod
+    def _parse_positive_int(value: Any, label: str) -> int:
+        parsed = MemoryWatchManager._parse_int(value, label)
+        if parsed < 1:
+            raise WatchError(f"{label}必须大于 0")
+        return parsed
+
+    @staticmethod
+    def _parse_non_negative_int(value: Any, label: str) -> int:
+        parsed = MemoryWatchManager._parse_int(value, label)
+        if parsed < 0:
+            raise WatchError(f"{label}不能小于 0")
+        return parsed
+
+    @staticmethod
+    def _parse_int(value: Any, label: str) -> int:
+        try:
+            if isinstance(value, int):
+                return value
+            return int(str(value).strip(), 0)
+        except (TypeError, ValueError) as e:
+            raise WatchError(f"{label}格式错误: {value}") from e
+
+    @staticmethod
+    def _parse_non_negative_float(value: Any, label: str) -> float:
+        try:
+            parsed = float(str(value).strip()) if not isinstance(value, (int, float)) else float(value)
+        except (TypeError, ValueError) as e:
+            raise WatchError(f"{label}格式错误: {value}") from e
+        if parsed < 0:
+            raise WatchError(f"{label}不能小于 0")
+        return parsed
 
     @staticmethod
     def _empty_stats() -> Dict[str, Any]:

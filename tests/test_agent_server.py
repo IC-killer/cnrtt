@@ -192,6 +192,10 @@ def test_reset_and_read_memory_rpc(server_factory):
         reset = c.call("reset")
         assert reset == {"ok": True}
         jlink.reset.assert_called_once()
+        assert c.call("halt") == {"ok": True}
+        jlink.halt.assert_called_once()
+        assert c.call("run") == {"ok": True}
+        jlink.go.assert_called_once()
 
         result = c.call("read_memory", {"address": "0x20000000", "size": "4"})
         assert result == {
@@ -245,6 +249,24 @@ def test_watch_control_rpc(server_factory):
         assert listing["running"] is False
         assert listing["items"][0]["name"] == "counter"
         assert "stats" in listing
+        assert "budget" in listing
+
+        budget = c.call(
+            "watch_budget_set",
+            {
+                "max_calls": 2,
+                "max_bytes": "0x20",
+                "max_cycle_ms": 0,
+                "merge_gap": 0,
+            },
+        )
+        assert budget == {
+            "max_read_calls_per_cycle": 2,
+            "max_bytes_per_cycle": 32,
+            "max_cycle_ms": 0.0,
+            "merge_gap": 0,
+        }
+        assert c.call("watch_budget_get") == budget
 
         c.call("watch_enable", {"id": added["id"], "enabled": False})
         assert c.call("watch_list")["items"][0]["enabled"] is False

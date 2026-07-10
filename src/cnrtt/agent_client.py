@@ -3,7 +3,7 @@
 提供两个用途：
 1. AgentClient 类 —— AI agent 集成时直接 copy 使用（纯 stdlib）。
 2. CLI 入口 —— 人工调试协议：status / connect / disconnect / send /
-   get_output / clear / config / reset / read_memory / watch 控制 / history。
+   get_output / clear / config / reset / halt / run / read_memory / watch 控制 / history。
 
 传输协议与 agent_server.py 一致：4 字节大端长度前缀 + JSON-RPC 2.0。
 """
@@ -200,6 +200,13 @@ def _parse_cli_int(value: str) -> int:
         raise argparse.ArgumentTypeError(f"非法整数: {value}") from e
 
 
+def _parse_cli_float(value: str) -> float:
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError) as e:
+        raise argparse.ArgumentTypeError(f"非法数字: {value}") from e
+
+
 def cli_main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="cnrtt-agent-client",
@@ -213,6 +220,8 @@ def cli_main(argv=None) -> int:
     sub.add_parser("status", help="查询当前状态")
     sub.add_parser("disconnect", help="断开 RTT")
     sub.add_parser("reset", help="通过 J-Link 复位目标")
+    sub.add_parser("halt", help="通过 J-Link 暂停目标")
+    sub.add_parser("run", help="通过 J-Link 运行目标")
 
     p_conn = sub.add_parser("connect", help="连接 RTT")
     p_conn.add_argument("--device", default=None)
@@ -268,6 +277,11 @@ def cli_main(argv=None) -> int:
     sub.add_parser("watch_start", help="开始变量采样")
     sub.add_parser("watch_stop", help="停止变量采样")
     sub.add_parser("watch_stats", help="查看最近一轮变量采样统计")
+    p_watch_budget = sub.add_parser("watch_budget", help="查看或设置变量采样预算")
+    p_watch_budget.add_argument("--max-calls", type=_parse_cli_int, default=None)
+    p_watch_budget.add_argument("--max-bytes", type=_parse_cli_int, default=None)
+    p_watch_budget.add_argument("--max-cycle-ms", type=_parse_cli_float, default=None)
+    p_watch_budget.add_argument("--merge-gap", type=_parse_cli_int, default=None)
 
     p_cfg = sub.add_parser("config", help="查询或设置配置")
     p_cfg.add_argument("--set", nargs="*", default=None, help="key=value 形式设置")
@@ -298,6 +312,10 @@ def cli_main(argv=None) -> int:
             _print_json(client.call("disconnect"))
         elif args.command == "reset":
             _print_json(client.call("reset"))
+        elif args.command == "halt":
+            _print_json(client.call("halt"))
+        elif args.command == "run":
+            _print_json(client.call("run"))
         elif args.command == "send":
             _print_json(
                 client.call(
@@ -362,6 +380,18 @@ def cli_main(argv=None) -> int:
             _print_json(client.call("watch_stop"))
         elif args.command == "watch_stats":
             _print_json(client.call("watch_stats"))
+        elif args.command == "watch_budget":
+            params = {}
+            if args.max_calls is not None:
+                params["max_calls"] = args.max_calls
+            if args.max_bytes is not None:
+                params["max_bytes"] = args.max_bytes
+            if args.max_cycle_ms is not None:
+                params["max_cycle_ms"] = args.max_cycle_ms
+            if args.merge_gap is not None:
+                params["merge_gap"] = args.merge_gap
+            method = "watch_budget_set" if params else "watch_budget_get"
+            _print_json(client.call(method, params))
         elif args.command == "config":
             if args.set:
                 params = {}

@@ -22,7 +22,13 @@ from cnrtt.core import (
     RTTCore,
     RTTError,
 )
-from cnrtt.watch import VALUE_TYPES
+from cnrtt.watch import (
+    DEFAULT_WATCH_MAX_BYTES,
+    DEFAULT_WATCH_MAX_CYCLE_MS,
+    DEFAULT_WATCH_MAX_READ_CALLS,
+    DEFAULT_WATCH_MERGE_GAP,
+    VALUE_TYPES,
+)
 
 # ANSI 颜色码到 RGB 颜色的映射
 ANSI_COLORS = {
@@ -255,6 +261,7 @@ class RTTViewerApp:
 
         # 启动期加载 GUI 配置（设备历史等）
         self.history = self.load_history()
+        self._restore_watch_budget_from_history()
 
         # AI agent server 配置与运行状态。server 由 GUI 自己管理，避免单独
         # 启动监听窗口；--with-agent 仅作为初始打开开关。
@@ -281,26 +288,26 @@ class RTTViewerApp:
 
         # --- UI 布局 ---
         # 顶部连接设置区
-        top_frame = tk.Frame(root, padx=10, pady=10)
+        top_frame = tk.Frame(root, padx=8, pady=8)
         top_frame.pack(fill=tk.X)
 
-        tk.Label(top_frame, text="设备型号:").grid(row=0, column=0, padx=5)
+        tk.Label(top_frame, text="设备").grid(row=0, column=0, padx=(0, 2))
         self.device_var = tk.StringVar(value=self.history.get("last_device", "STM32F407VE"))
-        self.device_combo = ttk.Combobox(top_frame, textvariable=self.device_var, values=self.history.get("devices", []), width=20)
-        self.device_combo.grid(row=0, column=1, padx=5)
+        self.device_combo = ttk.Combobox(top_frame, textvariable=self.device_var, values=self.history.get("devices", []), width=16)
+        self.device_combo.grid(row=0, column=1, padx=(0, 6))
 
-        tk.Label(top_frame, text="接口:").grid(row=0, column=2, padx=5)
+        tk.Label(top_frame, text="接口").grid(row=0, column=2, padx=(0, 2))
         self.iface_var = tk.StringVar(value="SWD")
-        self.iface_combo = ttk.Combobox(top_frame, textvariable=self.iface_var, values=["SWD", "JTAG"], width=5, state="readonly")
-        self.iface_combo.grid(row=0, column=3, padx=5)
+        self.iface_combo = ttk.Combobox(top_frame, textvariable=self.iface_var, values=["SWD", "JTAG"], width=4, state="readonly")
+        self.iface_combo.grid(row=0, column=3, padx=(0, 6))
 
-        tk.Label(top_frame, text="字符集:").grid(row=0, column=4, padx=5)
+        tk.Label(top_frame, text="编码").grid(row=0, column=4, padx=(0, 2))
         self.charset_var = tk.StringVar(value=self.history.get("last_charset", "UTF-8"))
-        self.charset_combo = ttk.Combobox(top_frame, textvariable=self.charset_var, values=["UTF-8", "GB2312"], width=8, state="readonly")
-        self.charset_combo.grid(row=0, column=5, padx=5)
+        self.charset_combo = ttk.Combobox(top_frame, textvariable=self.charset_var, values=["UTF-8", "GB2312"], width=7, state="readonly")
+        self.charset_combo.grid(row=0, column=5, padx=(0, 6))
 
         self.connect_btn = tk.Button(top_frame, text="连接", command=self.toggle_connection)
-        self.connect_btn.grid(row=0, column=6, padx=10)
+        self.connect_btn.grid(row=0, column=6, padx=(0, 6))
 
         self.reset_btn = tk.Button(
             top_frame,
@@ -308,7 +315,23 @@ class RTTViewerApp:
             command=self.reset_target,
             state=tk.DISABLED,
         )
-        self.reset_btn.grid(row=0, column=7, padx=(0, 10))
+        self.reset_btn.grid(row=0, column=7, padx=(0, 3))
+
+        self.pause_btn = tk.Button(
+            top_frame,
+            text="暂停",
+            command=self.pause_target,
+            state=tk.DISABLED,
+        )
+        self.pause_btn.grid(row=0, column=8, padx=(0, 3))
+
+        self.run_btn = tk.Button(
+            top_frame,
+            text="运行",
+            command=self.run_target,
+            state=tk.DISABLED,
+        )
+        self.run_btn.grid(row=0, column=9, padx=(0, 8))
 
         self.jlink_status_var = tk.StringVar(value="J-Link: 未连接")
         self.jlink_status_label = tk.Label(
@@ -317,11 +340,11 @@ class RTTViewerApp:
             anchor="w",
             fg="#555555",
         )
-        self.jlink_status_label.grid(row=0, column=8, sticky="ew", padx=(0, 10))
+        self.jlink_status_label.grid(row=0, column=10, sticky="ew", padx=(0, 6))
 
-        top_frame.grid_columnconfigure(8, weight=1)
+        top_frame.grid_columnconfigure(10, weight=1)
         watch_toolbar = tk.Frame(top_frame)
-        watch_toolbar.grid(row=0, column=9, sticky="e")
+        watch_toolbar.grid(row=0, column=11, sticky="e")
 
         self.watch_panel_visible = bool(self.history.get("watch_panel_visible", False))
         self.watch_toggle_btn = tk.Button(
@@ -548,6 +571,80 @@ class RTTViewerApp:
         self.watch_clear_btn = tk.Button(editor, text="清空", command=self.clear_watch_items)
         self.watch_clear_btn.pack(side=tk.LEFT)
 
+        budget_tools = tk.Frame(self.watch_panel)
+        budget_tools.pack(fill=tk.X, pady=(0, 4))
+
+        budget = self.core.get_memory_watch_budget()
+        tk.Label(budget_tools, text="采样预算:").pack(side=tk.LEFT)
+
+        tk.Label(budget_tools, text="读次").pack(side=tk.LEFT, padx=(8, 2))
+        self.watch_max_calls_var = tk.StringVar(
+            value=str(budget.get("max_read_calls_per_cycle", DEFAULT_WATCH_MAX_READ_CALLS))
+        )
+        self.watch_max_calls_entry = tk.Entry(
+            budget_tools,
+            textvariable=self.watch_max_calls_var,
+            width=6,
+        )
+        self.watch_max_calls_entry.pack(side=tk.LEFT, padx=(0, 6))
+
+        tk.Label(budget_tools, text="字节").pack(side=tk.LEFT, padx=(0, 2))
+        self.watch_max_bytes_var = tk.StringVar(
+            value=str(budget.get("max_bytes_per_cycle", DEFAULT_WATCH_MAX_BYTES))
+        )
+        self.watch_max_bytes_entry = tk.Entry(
+            budget_tools,
+            textvariable=self.watch_max_bytes_var,
+            width=8,
+        )
+        self.watch_max_bytes_entry.pack(side=tk.LEFT, padx=(0, 6))
+
+        tk.Label(budget_tools, text="耗时ms").pack(side=tk.LEFT, padx=(0, 2))
+        self.watch_max_cycle_ms_var = tk.StringVar(
+            value=self._format_budget_number(
+                budget.get("max_cycle_ms", DEFAULT_WATCH_MAX_CYCLE_MS)
+            )
+        )
+        self.watch_max_cycle_ms_entry = tk.Entry(
+            budget_tools,
+            textvariable=self.watch_max_cycle_ms_var,
+            width=7,
+        )
+        self.watch_max_cycle_ms_entry.pack(side=tk.LEFT, padx=(0, 6))
+
+        tk.Label(budget_tools, text="合并间隙").pack(side=tk.LEFT, padx=(0, 2))
+        self.watch_merge_gap_var = tk.StringVar(
+            value=str(budget.get("merge_gap", DEFAULT_WATCH_MERGE_GAP))
+        )
+        self.watch_merge_gap_entry = tk.Entry(
+            budget_tools,
+            textvariable=self.watch_merge_gap_var,
+            width=6,
+        )
+        self.watch_merge_gap_entry.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.watch_budget_apply_btn = tk.Button(
+            budget_tools,
+            text="应用",
+            command=self.apply_watch_budget,
+        )
+        self.watch_budget_apply_btn.pack(side=tk.LEFT, padx=(0, 5))
+
+        self.watch_budget_default_btn = tk.Button(
+            budget_tools,
+            text="默认",
+            command=self.reset_watch_budget,
+        )
+        self.watch_budget_default_btn.pack(side=tk.LEFT)
+
+        for entry in (
+            self.watch_max_calls_entry,
+            self.watch_max_bytes_entry,
+            self.watch_max_cycle_ms_entry,
+            self.watch_merge_gap_entry,
+        ):
+            entry.bind("<Return>", self.apply_watch_budget)
+
         symbol_tools = tk.Frame(self.watch_panel)
         symbol_tools.pack(fill=tk.X, pady=(0, 4))
 
@@ -689,6 +786,83 @@ class RTTViewerApp:
         self.watch_search_tree.bind("<Button-3>", self.show_watch_search_popup)
         self.watch_search_results: List[Dict[str, Any]] = []
         self.watch_search_mode = False
+
+    @staticmethod
+    def _format_budget_number(value: Any) -> str:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        if number.is_integer():
+            return str(int(number))
+        return f"{number:g}"
+
+    def _restore_watch_budget_from_history(self):
+        budget = self.history.get("watch_budget")
+        if not isinstance(budget, dict):
+            return
+        try:
+            self.core.set_memory_watch_budget(
+                max_read_calls_per_cycle=budget.get("max_read_calls_per_cycle"),
+                max_bytes_per_cycle=budget.get("max_bytes_per_cycle"),
+                max_cycle_ms=budget.get("max_cycle_ms"),
+                merge_gap=budget.get("merge_gap"),
+            )
+        except RTTError:
+            pass
+
+    def _sync_watch_budget_fields(self, budget: Optional[Dict[str, Any]] = None):
+        if not hasattr(self, "watch_max_calls_var"):
+            return
+        budget = budget or self.core.get_memory_watch_budget()
+        self.watch_max_calls_var.set(
+            str(budget.get("max_read_calls_per_cycle", DEFAULT_WATCH_MAX_READ_CALLS))
+        )
+        self.watch_max_bytes_var.set(
+            str(budget.get("max_bytes_per_cycle", DEFAULT_WATCH_MAX_BYTES))
+        )
+        self.watch_max_cycle_ms_var.set(
+            self._format_budget_number(
+                budget.get("max_cycle_ms", DEFAULT_WATCH_MAX_CYCLE_MS)
+            )
+        )
+        self.watch_merge_gap_var.set(
+            str(budget.get("merge_gap", DEFAULT_WATCH_MERGE_GAP))
+        )
+
+    def apply_watch_budget(self, event=None):
+        try:
+            budget = self.core.set_memory_watch_budget(
+                max_read_calls_per_cycle=self.watch_max_calls_var.get(),
+                max_bytes_per_cycle=self.watch_max_bytes_var.get(),
+                max_cycle_ms=self.watch_max_cycle_ms_var.get(),
+                merge_gap=self.watch_merge_gap_var.get(),
+            )
+        except RTTError as e:
+            self.watch_status_var.set(f"采样预算无效: {e}")
+            return "break" if event is not None else None
+        self._sync_watch_budget_fields(budget)
+        self.save_history()
+        self.watch_status_var.set(
+            "采样预算已应用: "
+            f"读 {budget['max_read_calls_per_cycle']} 次，"
+            f"{budget['max_bytes_per_cycle']}B，"
+            f"{self._format_budget_number(budget['max_cycle_ms'])}ms，"
+            f"间隙 {budget['merge_gap']}B"
+        )
+        return "break" if event is not None else budget
+
+    def reset_watch_budget(self):
+        budget = self.core.set_memory_watch_budget(
+            max_read_calls_per_cycle=DEFAULT_WATCH_MAX_READ_CALLS,
+            max_bytes_per_cycle=DEFAULT_WATCH_MAX_BYTES,
+            max_cycle_ms=DEFAULT_WATCH_MAX_CYCLE_MS,
+            merge_gap=DEFAULT_WATCH_MERGE_GAP,
+        )
+        self._sync_watch_budget_fields(budget)
+        self.save_history()
+        self.watch_status_var.set("采样预算已恢复默认")
+        return budget
 
     def _restore_watch_items(self):
         items = self.history.get("watch_items", [])
@@ -1372,12 +1546,16 @@ class RTTViewerApp:
         if connected:
             self.connect_btn.config(text="断开")
             self.reset_btn.config(state=tk.NORMAL)
+            self.pause_btn.config(state=tk.NORMAL)
+            self.run_btn.config(state=tk.NORMAL)
             self.device_combo.config(state=tk.DISABLED)
             self.iface_combo.config(state=tk.DISABLED)
             self.charset_combo.config(state=tk.DISABLED)
         else:
             self.connect_btn.config(text="连接")
             self.reset_btn.config(state=tk.DISABLED)
+            self.pause_btn.config(state=tk.DISABLED)
+            self.run_btn.config(state=tk.DISABLED)
             self.device_combo.config(state="normal")
             self.iface_combo.config(state="readonly")
             self.charset_combo.config(state="readonly")
@@ -1415,6 +1593,8 @@ class RTTViewerApp:
                 self.echo_send_var.set(bool(cfg["echo_send"]))
             if "hex_dump" in cfg and self.hex_dump_var.get() != cfg["hex_dump"]:
                 self.hex_dump_var.set(bool(cfg["hex_dump"]))
+            if "memory_watch_budget" in cfg:
+                self._sync_watch_budget_fields(cfg.get("memory_watch_budget"))
         except Exception:
             pass
 
@@ -1470,6 +1650,7 @@ class RTTViewerApp:
             watch_items=self.core.list_watch_items(include_runtime=False),
             watch_axf_path=self.watch_axf_path,
             watch_panel_visible=self.watch_panel_visible,
+            watch_budget=self.core.get_memory_watch_budget(),
         )
         # 同步设备下拉列表
         self.device_combo['values'] = self.core.get_gui_devices()
@@ -1503,6 +1684,18 @@ class RTTViewerApp:
             self.core.reset_target()
         except RTTError as e:
             self.append_output(f"[复位错误] {e}\n")
+
+    def pause_target(self):
+        try:
+            self.core.halt_target()
+        except RTTError as e:
+            self.append_output(f"[暂停错误] {e}\n")
+
+    def run_target(self):
+        try:
+            self.core.run_target()
+        except RTTError as e:
+            self.append_output(f"[运行错误] {e}\n")
 
     def send_input(self, event=None):
         text = self.input_entry.get()

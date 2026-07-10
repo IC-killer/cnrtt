@@ -53,6 +53,14 @@ Disconnect from target.
 {"jsonrpc": "2.0", "id": 3, "method": "disconnect"}
 ```
 
+### reset / halt / run
+Control target state through J-Link.
+```json
+{"jsonrpc": "2.0", "id": 31, "method": "reset"}
+{"jsonrpc": "2.0", "id": 32, "method": "halt"}
+{"jsonrpc": "2.0", "id": 33, "method": "run"}
+```
+
 ### send
 Send text to RTT channel 0.
 ```json
@@ -71,6 +79,25 @@ Modify settings.
 ```json
 {"jsonrpc": "2.0", "id": 6, "method": "set_config", "params": {"charset": "UTF-8", "echo_send": true}}
 ```
+
+### read_memory
+Read target memory through the active J-Link session.
+```json
+{"jsonrpc": "2.0", "id": 7, "method": "read_memory", "params": {"address": "0x20000000", "size": 4}}
+```
+Response: `{"address": 536870912, "size": 4, "hex": "78 56 34 12", "bytes": [120, 86, 52, 18]}`
+
+### variable watch
+Add periodic memory watch items and control sampling.
+```json
+{"jsonrpc": "2.0", "id": 8, "method": "watch_add", "params": {"name": "counter", "address": "0x20000000", "type": "u32", "period_ms": 250}}
+{"jsonrpc": "2.0", "id": 9, "method": "watch_budget_set", "params": {"max_calls": 32, "max_bytes": "0x2000", "max_cycle_ms": 10, "merge_gap": 16}}
+{"jsonrpc": "2.0", "id": 10, "method": "watch_start"}
+{"jsonrpc": "2.0", "id": 11, "method": "watch_list", "params": {"include_runtime": true}}
+{"jsonrpc": "2.0", "id": 12, "method": "watch_stop"}
+```
+
+Other watch methods: `watch_remove`, `watch_clear`, `watch_enable`, `watch_stats`, `watch_budget_get`.
 
 ## Server Notifications (Push)
 
@@ -92,6 +119,12 @@ Connection state changed.
 Error occurred.
 ```json
 {"jsonrpc": "2.0", "method": "error", "params": {"message": "..."}}
+```
+
+### watch
+Variable watch list or sampled values changed.
+```json
+{"jsonrpc": "2.0", "method": "watch", "params": {"items": [], "running": false, "stats": {}}}
 ```
 
 ## Error Codes
@@ -121,7 +154,9 @@ Each message is prefixed with 4-byte big-endian length:
 
 2. **Output batching**: The `output` notification batches data within 50ms windows to avoid flooding the client.
 
-3. **Authentication**: When server is started with `--agent-token`, all requests must include `"auth": "<token>"` field.
+3. **Watch sampling budget**: Use `watch_budget_set` before `watch_start` when many variables are watched, so J-Link IO does not starve RTT logging.
+
+4. **Authentication**: When server is started with `--agent-token`, all requests must include `"auth": "<token>"` field.
 
 ## Full Protocol Documentation
 

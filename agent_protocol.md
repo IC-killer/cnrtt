@@ -1,7 +1,8 @@
-# cnrtt Agent 协议规范 (v1.0)
+# cnrtt Agent 协议规范 (v1.1)
 
 cnrtt 提供一个基于 **JSON-RPC 2.0 over TCP** 的本地控制接口，允许 AI agent
-（或任何外部程序）完全控制工具的输入、输出与配置。
+（或任何外部程序）控制工具的输入、输出、J-Link 目标状态、在线内存读取、
+变量监控与配置。
 
 本协议文档面向 AI agent 集成者。配套的参考客户端见
 `src/cnrtt/agent_client.py`（纯 stdlib，可直接 copy 使用）。
@@ -109,7 +110,14 @@ python -m cnrtt --headless --port 7000 --agent-token MY_SECRET
   "charset": "UTF-8",
   "echo_send": false,
   "hex_dump": false,
-  "connected": false
+  "connected": false,
+  "memory_read_limit": 65536,
+  "memory_watch_budget": {
+    "max_read_calls_per_cycle": 64,
+    "max_bytes_per_cycle": 16384,
+    "max_cycle_ms": 25.0,
+    "merge_gap": 16
+  }
 }
 ```
 
@@ -147,7 +155,20 @@ python -m cnrtt --headless --port 7000 --agent-token MY_SECRET
 
 ---
 
-### 4.4 `send` — 发送文本到 RTT 通道 0
+### 4.4 `reset` / `halt` / `run` — J-Link 目标控制
+
+| 方法 | 说明 | 响应 |
+|---|---|---|
+| `reset` | 通过 J-Link reset 复位目标 | `{ "ok": true }` |
+| `halt` | 通过 J-Link halt 暂停目标 | `{ "ok": true }` |
+| `pause` | `halt` 的兼容别名 | `{ "ok": true }` |
+| `run` | 通过 J-Link go 运行目标；底层不支持 `go` 时退到 `restart` | `{ "ok": true }` |
+
+**错误**：未连接返回 `-32001`；J-Link 调用异常返回 `-32603`。
+
+---
+
+### 4.5 `send` — 发送文本到 RTT 通道 0
 
 **请求参数**：
 
@@ -165,7 +186,7 @@ python -m cnrtt --headless --port 7000 --agent-token MY_SECRET
 
 ---
 
-### 4.5 `get_output` — 增量拉取输出
+### 4.6 `get_output` — 增量拉取输出
 
 **请求参数**：
 
@@ -190,13 +211,40 @@ python -m cnrtt --headless --port 7000 --agent-token MY_SECRET
 
 ---
 
-### 4.6 `clear_output` — 清空输出缓冲
+### 4.7 `clear_output` — 清空输出缓冲
 
 **响应**：`{ "ok": true }`
 
 ---
 
-### 4.7 `get_config` / `set_config` — 读写运行期配置
+### 4.8 `read_memory` — 在线读取目标内存
+
+通过当前 J-Link 会话读取目标内存，不主动暂停目标。读取参数会在进入 J-Link
+IO 前校验，单次读取大小受 `memory_read_limit` 限制。
+
+**请求参数**：
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `address` | int/string | 是 | 起始地址，支持 `0x20000000` 形式 |
+| `size` | int/string | 是 | 读取字节数，必须大于 0 |
+
+**响应**：
+
+```jsonc
+{
+  "address": 536870912,
+  "size": 4,
+  "hex": "78 56 34 12",
+  "bytes": [120, 86, 52, 18]
+}
+```
+
+**错误**：参数错误返回 `-32602`；未连接返回 `-32001`；访问异常返回 `-32603`。
+
+---
+
+### 4.9 `get_config` / `set_config` — 读写运行期配置
 
 `set_config` 支持的字段：
 
@@ -215,7 +263,60 @@ python -m cnrtt --headless --port 7000 --agent-token MY_SECRET
 
 ---
 
-### 4.8 `save_config` — 持久化 GUI 配置
+### 4.10 变量监控方法
+
+变量监控项由 cnrtt 通过 `read_memory` 周期采样。GUI 和 agent 共用同一份监控列表。
+
+#### `watch_add`
+
+**请求参数**：
+
+| 字段 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `name` | string | 是 | 监控项名称 |
+| `address` | int/string | 是 | 目标地址 |
+| `type` / `value_type` | string | 否 | 默认 `u32`；支持 `u8/u16/u32/u64/s8/s16/s32/s64/float/double` |
+| `period_ms` | int/string | 否 | 默认 `500`，最小按 50ms 处理 |
+| `enabled` | bool/string | 否 | 默认 `true` |
+| `source` | string | 否 | 默认 `agent` |
+
+**响应**：返回新增监控项。
+
+#### 监控列表和控制
+
+| 方法 | 参数 | 响应 |
+|---|---|---|
+| `watch_list` | `{ "include_runtime": true }` | `{ "items": [...], "running": bool, "stats": {...}, "budget": {...} }` |
+| `watch_remove` | `{ "id": "..." }` | `{ "ok": true }` |
+| `watch_clear` | 无 | `{ "ok": true }` |
+| `watch_enable` | `{ "id": "...", "enabled": false }` | `{ "ok": true }` |
+| `watch_start` | 无 | `{ "running": true }` |
+| `watch_stop` | 无 | `{ "running": false }` |
+| `watch_stats` | 无 | 最近一轮采样统计 |
+
+`watch_list(include_runtime=true)` 的 `items` 会包含 `value/raw/error/read_count/fail_count/latency_ms`
+等运行态字段；`include_runtime=false` 只返回可持久化配置字段。
+
+#### `watch_budget_get` / `watch_budget_set`
+
+采样预算用于限制每一轮变量监控对 J-Link 的占用。
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `max_read_calls_per_cycle` / `max_calls` | int/string | 每轮最多内存读取调用次数，默认 `64` |
+| `max_bytes_per_cycle` / `max_bytes` | int/string | 每轮最多读取字节数，默认 `16384` |
+| `max_cycle_ms` | number/string | 每轮最大采样耗时，默认 `25.0`；`0` 表示不按耗时限制 |
+| `merge_gap` | int/string | 相邻变量地址可合并读取的最大间隙字节数，默认 `16` |
+
+**示例**：
+
+```jsonc
+{"jsonrpc":"2.0","id":20,"method":"watch_budget_set","params":{"max_calls":32,"max_bytes":"0x2000","max_cycle_ms":10,"merge_gap":16}}
+```
+
+---
+
+### 4.11 `save_config` — 持久化 GUI 配置
 
 把当前配置写入 `~/.cnrtt/rtt_history.json`。
 
@@ -223,7 +324,7 @@ python -m cnrtt --headless --port 7000 --agent-token MY_SECRET
 
 ---
 
-### 4.9 `get_agent_history` / `clear_agent_history` — agent 命令历史
+### 4.12 `get_agent_history` / `clear_agent_history` — agent 命令历史
 
 | 方法 | 参数 | 响应 |
 |---|---|---|
@@ -243,6 +344,7 @@ python -m cnrtt --headless --port 7000 --agent-token MY_SECRET
 | `output` | `{ "text": "..." }` | RTT 有新数据；**攒批 50ms** 合并发送，避免高频刷死 agent |
 | `status` | `{ "connected": bool }` | 连接/断开变化 |
 | `error` | `{ "message": "..." }` | 读取/发送等异常 |
+| `watch` | `{ "items": [...], "running": bool, "stats": {...} }` | 变量监控列表、运行状态或采样值变化 |
 
 ### `output` 攒批策略
 
@@ -283,9 +385,9 @@ python -m cnrtt --headless --port 7000 --agent-token MY_SECRET
 
 | 文件 | 用途 | 由谁读写 |
 |---|---|---|
-| `~/.cnrtt/rtt_history.json` | GUI 配置：设备历史、字符集、echo/hex、人工输入历史 | GUI / `save_config` |
+| `~/.cnrtt/rtt_history.json` | GUI 配置：设备历史、字符集、echo/hex、人工输入历史、AXF 路径、变量监控列表、变量采样预算 | GUI / `save_config` |
 | `~/.cnrtt/agent_config.json` | agent 配置（端口、token 等自定义字段） | agent 自行管理 |
-| `~/.cnrtt/agent_history.json` | agent 命令历史 | core 自动记录 `connect`/`send` |
+| `~/.cnrtt/agent_history.json` | agent 命令历史 | core 自动记录 `connect`/`disconnect`/`reset`/`halt`/`run`/`send` |
 
 > 三份文件**互不干扰**：agent 不会污染 GUI 的人工输入历史，反之亦然。
 
@@ -300,14 +402,40 @@ c = AgentClient("127.0.0.1", 7000)
 try:
     print(c.call("status"))
     c.call("connect", {"device": "STM32F407VE", "iface": "SWD"})
+    c.call("reset")
+    c.call("run")
     c.call("send", {"text": "led on"})
 
     # 拉取最近输出
     r = c.call("get_output", {"limit": 100})
     for line in r["lines"]:
         print(line, end="")
+
+    # 在线读取内存
+    memory = c.call("read_memory", {"address": "0x20000000", "size": 4})
+    print(memory["hex"])
 finally:
     c.close()
+```
+
+### 变量监控示例
+
+```python
+c.call("watch_add", {
+    "name": "counter",
+    "address": "0x20000000",
+    "type": "u32",
+    "period_ms": 250,
+})
+c.call("watch_budget_set", {
+    "max_calls": 32,
+    "max_bytes": "0x2000",
+    "max_cycle_ms": 10,
+    "merge_gap": 16,
+})
+c.call("watch_start")
+items = c.call("watch_list")["items"]
+c.call("watch_stop")
 ```
 
 ### 监听推送（用独立 client，避免与 call 冲突）
@@ -344,6 +472,11 @@ cnrtt-agent-client status
 # 连接
 cnrtt-agent-client connect --device STM32F407VE --iface SWD
 
+# J-Link 目标控制
+cnrtt-agent-client reset
+cnrtt-agent-client halt
+cnrtt-agent-client run
+
 # 发送
 cnrtt-agent-client send --text "led on"
 cnrtt-agent-client send --text "ping" --no-newline
@@ -354,6 +487,18 @@ cnrtt-agent-client get_output --since 42 --clear
 
 # 清空
 cnrtt-agent-client clear
+
+# 在线内存读取
+cnrtt-agent-client read_memory --address 0x20000000 --size 4
+
+# 变量监控
+cnrtt-agent-client watch_add --name counter --address 0x20000000 --type u32 --period-ms 250
+cnrtt-agent-client watch_start
+cnrtt-agent-client watch_list
+cnrtt-agent-client watch_stats
+cnrtt-agent-client watch_budget
+cnrtt-agent-client watch_budget --max-calls 32 --max-bytes 0x2000 --max-cycle-ms 10 --merge-gap 16
+cnrtt-agent-client watch_stop
 
 # 配置
 cnrtt-agent-client config                          # 查询
@@ -378,4 +523,5 @@ cnrtt-agent-client --port 8000 --token MY_SECRET status
 
 | 版本 | 日期 | 变更 |
 |---|---|---|
+| v1.1 | 2026-07-08 | 增加 J-Link reset/halt/run、在线 `read_memory`、变量监控、采样预算和 `watch` 推送 |
 | v1.0 | 2026-07-03 | 首版：JSON-RPC 2.0 over TCP + 长度前缀分帧 + token 鉴权 + 攒批推送 |

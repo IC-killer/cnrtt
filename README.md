@@ -11,8 +11,11 @@
 - **SWD / JTAG 双接口**：通过下拉框切换
 - **设备型号记忆**：自动保存最近使用过的设备型号到 `~/.cnrtt/rtt_history.json`
 - **双向通信**：可读取 MCU 上行日志，也可向 MCU 下行发送字符串
+- **J-Link 目标控制**：连接后可直接复位、暂停、运行目标 MCU
+- **AXF 变量监控**：加载 AXF 后搜索变量，右键加入监控列表，在线读取变量值
+- **采样预算控制**：变量监控支持每轮读次数、字节数、耗时和合并间隙配置，并显示采样统计
 - **AI 协同调试**：主窗口内置 AI Agent server 开关、监听状态和端口配置，人工与 AI 共享同一个 RTT core
-- **Agent 协议**：提供 JSON-RPC 2.0 over TCP 控制接口，便于 AI agent 查询状态、连接目标板、发送命令和读取日志
+- **Agent 协议**：提供 JSON-RPC 2.0 over TCP 控制接口，便于 AI agent 查询状态、连接目标板、控制复位/暂停/运行、发送命令、读取日志和监控内存变量
 - **目标板命令发现**：默认目标板支持 `k:help` 指令，连接后可先发送该命令获取固件侧命令列表
 - **只读保护**：输出框拦截键盘输入，仅允许复制 / 全选 / 方向键
 - **右键复制菜单**：方便复制选中日志
@@ -58,6 +61,33 @@ python -m cnrtt
 2. 选择 **接口**（SWD 或 JTAG）
 3. 点击 **连接**，连接成功后即可在中央文本框看到 RTT 输出
 4. 在底部输入框输入字符串并回车，可向 MCU 发送数据（自动追加 `\n`）
+
+顶部连接区连接成功后会启用三个 J-Link 目标控制按钮：
+
+- **复位**：调用 J-Link reset 复位目标
+- **暂停**：调用 J-Link halt 暂停目标
+- **运行**：调用 J-Link go 让目标继续运行
+
+### 变量监控和 AXF 搜索
+
+点击顶部 **变量** 可展开变量监控面板：
+
+1. 点击 **加载AXF** 选择 Keil/AC6 生成的 `.axf` 文件
+2. 在 **AXF搜索** 输入变量名或路径片段，点击 **搜索**
+3. 搜索结果会临时替换监控表格；选中结果后右键 **添加到监控列表**，或双击/回车添加
+4. 点击 **返回监控列表** 回到实时监控表格
+5. 点击 **开始采样** 后，cnrtt 通过 J-Link 在线读取变量值
+
+变量监控支持基础整数和浮点类型，也会尽量从 DWARF 信息展开结构体字段、数组元素、枚举和指针地址。采样时相邻地址会合并为一次内存读取，状态栏会显示本轮采样数量、J-Link 读次数、读取字节数、耗时、合并节省、跳过和失败信息。
+
+**采样预算** 用于限制变量监控对 J-Link 的占用：
+
+- **读次**：每轮最多发起多少次内存读取
+- **字节**：每轮最多读取多少字节
+- **耗时ms**：每轮采样耗时上限，`0` 表示不按耗时限制
+- **合并间隙**：相邻变量地址间隔不超过该字节数时合并读取
+
+预算会随 GUI 历史配置保存到 `~/.cnrtt/rtt_history.json`。
 
 ### AI Agent server
 
@@ -111,8 +141,16 @@ pwsh -File scripts\create_shortcut.ps1
 
 ```bash
 cnrtt-agent-client --port 7000 connect --device STM32F407VE --iface SWD
+cnrtt-agent-client --port 7000 reset
+cnrtt-agent-client --port 7000 halt
+cnrtt-agent-client --port 7000 run
 cnrtt-agent-client --port 7000 send --text "k:help"
 cnrtt-agent-client --port 7000 get_output --limit 200
+cnrtt-agent-client --port 7000 read_memory --address 0x20000000 --size 4
+cnrtt-agent-client --port 7000 watch_add --name counter --address 0x20000000 --type u32 --period-ms 250
+cnrtt-agent-client --port 7000 watch_start
+cnrtt-agent-client --port 7000 watch_list
+cnrtt-agent-client --port 7000 watch_budget --max-calls 32 --max-bytes 0x2000 --max-cycle-ms 10 --merge-gap 16
 ```
 
 项目内置 CodeBuddy skill，路径为 `.codebuddy/skills/cnrtt`。它包含 cnrtt agent 协议速查、常用 helper 脚本和默认 `k:help` 调试流程：
@@ -135,7 +173,7 @@ sudo apt-get install python3-tk
 
 ## 配置文件
 
-GUI 历史设备型号保存在：
+GUI 历史设备型号、输入历史、AXF 路径、变量监控列表、变量面板显示状态和采样预算保存在：
 
 - Linux / macOS: `~/.cnrtt/rtt_history.json`
 - Windows: `%USERPROFILE%\.cnrtt\rtt_history.json`
